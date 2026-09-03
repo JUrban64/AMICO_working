@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Data and models
+*.pt
+*.pth
+*.npz
+*.ds
+*.json
+*.csv
+data_prep/temp_prank_out/
+temp_inference/
+temp/
+p2rank_2.5.1/
+*_prank_output/
+data_prep/*.txt
+# macOS
+.DS_Store
