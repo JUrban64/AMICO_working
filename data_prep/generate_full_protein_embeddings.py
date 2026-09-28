@@ -1,15 +1,22 @@
 import os
+import csv
 import argparse
 import torch
 import numpy as np
 from tqdm import tqdm
 from Bio.PDB import PDBParser
 import glob
-
-# Přidání cesty pro import
 import sys
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from esm2_feature_ex import ESMFeatureExtractor
+
+# Přidání cesty pro import z kořenového adresáře AMICO
+root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if root_dir not in sys.path:
+    sys.path.insert(0, root_dir)
+
+try:
+    from esm_extractor import ESMFeatureExtractor
+except ImportError:
+    from esm2_feature_ex import ESMFeatureExtractor
 
 def is_aa(residue):
     return residue.get_id()[0] == ' '
@@ -19,7 +26,7 @@ def get_full_sequence_from_pdb(pdb_path):
     try:
         structure = parser.get_structure('protein', pdb_path)
     except Exception as e:
-        print(f"Error parsing {pdb_path}: {e}")
+        print(f"Chyba při parsování {pdb_path}: {e}")
         return None
 
     three_to_one = {
@@ -31,7 +38,6 @@ def get_full_sequence_from_pdb(pdb_path):
     }
     
     sequence = []
-    # Procházíme atomy a extrahujeme celou sekvenci (pro všechny chainy)
     for model in structure:
         for chain in model:
             for residue in chain:
@@ -47,114 +53,146 @@ def get_full_sequence_from_pdb(pdb_path):
         return None
     return seq_str
 
+def find_metadata_tsv(candidate_paths):
+    for p in candidate_paths:
+        if p and os.path.exists(p) and os.path.getsize(p) > 0:
+            return p
+    return None
+
 def main():
-    parser = argparse.ArgumentParser(description="Vygeneruje full protein embeddings z původních PDB souborů")
-    parser.add_argument('--pdb-dir', type=str, required=True, help='Cesta ke složce se všemi PDB strukturami')
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    default_pdb_dir = os.path.join(base_dir, 'structures', 'all_pdbs')
+    if not os.path.exists(default_pdb_dir):
+        default_pdb_dir = os.path.join(base_dir, 'structures')
+
+    default_metadata = os.path.join(base_dir, 'structures', 'dataset_metadata.tsv')
+
+    parser = argparse.ArgumentParser(description="Vygeneruje full protein embeddings z PDB struktur pomocí ESM-2")
+    parser.add_argument('--pdb-dir', type=str, default=default_pdb_dir, help='Cesta ke složce se všemi PDB strukturami (např. structures/all_pdbs)')
+    parser.add_argument('--metadata', type=str, default=default_metadata, help='Cesta k dataset_metadata.tsv (pokud existuje)')
+    parser.add_argument('--dataset-path', type=str, default=os.path.join(base_dir, 'data_prep', 'esm_dataset.pt'), help='Cesta k esm_dataset.pt (volitelné)')
+    parser.add_argument('--out-path', type=str, default=os.path.join(base_dir, 'data_prep', 'esm_full_proteins.pt'), help='Výstupní soubor pro embeddings')
+    parser.add_argument('--model-name', type=str, default='facebook/esm2_t33_650M_UR50D', help='ESM-2 model z HuggingFace')
+    parser.add_argument('--device', type=str, default=None, help='Zařízení (cuda, mps, cpu)')
+    parser.add_argument('--save-interval', type=int, default=250, help='Interval průběžného ukládání')
     args = parser.parse_args()
 
-    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    dataset_path = os.path.join(base_dir, 'data_prep', 'esm_dataset.pt')
-    out_path = os.path.join(base_dir, 'data_prep', 'esm_full_proteins.pt')
-    
-    print(f"Loading pockets dataset from {dataset_path} to find unique proteins...")
-    raw_data = torch.load(dataset_path, weights_only=False)
-    
+    out_path = args.out_path
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+
+    # 1. Zjištění množiny proteinů ke zpracování
     unique_pids = set()
-    for item in raw_data:
-        raw_pid = item['protein_id']
-        base_name = os.path.basename(raw_pid)
-        pid = base_name.split('_pocket_')[0].replace('.pdb', '').replace('_prank_output', '')
-        unique_pids.add(pid)
-        
-    print(f"Found {len(unique_pids)} unique proteins.")
+    metadata_file = find_metadata_tsv([args.metadata, os.path.join(args.pdb_dir, '..', 'dataset_metadata.tsv'), os.path.join(args.pdb_dir, 'dataset_metadata.tsv')])
     
-    # Zkusíme načíst dosud zpracované, abychom mohli navázat (resume)
+    if metadata_file:
+        print(f"-> Načítám seznam proteinů z metadat: {metadata_file}")
+        with open(metadata_file, 'r', encoding='utf-8') as f:
+            reader = csv.reader(f, delimiter='\t')
+            next(reader, None) # přeskočit hlavičku
+            for row in reader:
+                if not row or len(row) < 2:
+                    continue
+                pdb_fname = row[1].strip()
+                if pdb_fname and pdb_fname != 'NONE':
+                    pid = pdb_fname.replace('.pdb', '').strip()
+                    unique_pids.add(pid)
+        print(f"-> Nalezeno {len(unique_pids)} proteinů v dataset_metadata.tsv.")
+    elif os.path.exists(args.dataset_path):
+        print(f"-> Načítám seznam proteinů z {args.dataset_path}...")
+        raw_data = torch.load(args.dataset_path, weights_only=False)
+        for item in raw_data:
+            raw_pid = item['protein_id']
+            base_name = os.path.basename(raw_pid)
+            pid = base_name.split('_pocket_')[0].replace('.pdb', '').replace('_prank_output', '')
+            unique_pids.add(pid)
+        print(f"-> Nalezeno {len(unique_pids)} unikátních proteinů v esm_dataset.pt.")
+    else:
+        print(f"-> Metadata ani esm_dataset.pt nenalezeny. Budou zpracovány všechny PDB soubory ve složce {args.pdb_dir}.")
+
+    # 2. Načtení případného předchozího běhu (Resume)
     if os.path.exists(out_path):
-        print(f"Nalezen předchozí běh v {out_path}, načítám pro případný resume...")
+        print(f"-> Nalezen předchozí běh v {out_path}, načítám pro resume...")
         full_embeddings_dict = torch.load(out_path, weights_only=False)
+        print(f"-> Již zpracováno: {len(full_embeddings_dict)} záznamů.")
     else:
         full_embeddings_dict = {}
 
-    extractor = ESMFeatureExtractor()
-    
-    # Připravíme si mapování z ID na cestu k PDB souboru
-    print(f"Hledám PDB soubory ve složce {args.pdb_dir}...")
+    # 3. Indexace souborů na disku
+    print(f"-> Hledám PDB soubory ve složce {args.pdb_dir}...")
     all_pdb_files = glob.glob(os.path.join(args.pdb_dir, '**', '*.pdb'), recursive=True)
-    
-    print(f"Nalezeno PDB souborů celkem: {len(all_pdb_files)}")
+    print(f"-> Nalezeno PDB souborů celkem: {len(all_pdb_files)}")
     if len(all_pdb_files) == 0:
-        print("CHYBA: Zadaná složka neobsahuje žádné .pdb soubory nebo cesta neexistuje.")
+        print("❌ CHYBA: Zadaná složka neobsahuje žádné .pdb soubory nebo cesta neexistuje.")
         return
-        
+
     pdb_map = {}
     for f in all_pdb_files:
-        if '_pocket_' in f:  # Přeskočíme kapsy, chceme původní plné proteiny
+        if '_pocket_' in f:
             continue
         basename = os.path.basename(f)
         pid = basename.replace('.pdb', '')
-        # Občas je ve jméně protein_id ještě navíc '_out' atd, budeme hledat přesnou shodu:
         pdb_map[pid] = f
-        
-    # DEBUG ukázky pro snazší pochopení problému s cestami/jmény:
-    print("\n--- DEBUG UKÁZKY NÁZVŮ ---")
-    print("Ukázka 3 ID z datasetu kapes (unique_pids):", list(unique_pids)[:3])
-    print("Ukázka 3 ID nalezených ve složce (pdb_map):", list(pdb_map.keys())[:3])
-    print("--------------------------\n")
-        
-    # Pokud některé proteiny z datasetu mají jiný název (např. P27352_MERGED), pokusíme se je spárovat
-    
+
+    # Pokud jsme neměli metadata ani dataset_path, vezmeme všechny nalezené PDB
+    if not unique_pids:
+        unique_pids = set(pdb_map.keys())
+
+    print(f"-> Celkem k ověření / zpracování: {len(unique_pids)} proteinů.")
+
+    # 4. Inicializace ESM modelu
+    extractor = ESMFeatureExtractor(model_name=args.model_name, device=args.device)
+
     missing_pdbs = 0
-    for pid in tqdm(unique_pids, desc="Processing proteins"):
+    newly_processed = 0
+    pbar = tqdm(sorted(list(unique_pids)), desc="Extrakce ESM proteinových embeddingů")
+
+    for pid in pbar:
         if pid in full_embeddings_dict:
             continue
-            
-        # Hledání správného PDB souboru
-        pdb_path = None
-        if pid in pdb_map:
-            pdb_path = pdb_map[pid]
-        else:
-            # Zkusme odstranit _MERGED apod.
+
+        pdb_path = pdb_map.get(pid)
+        if not pdb_path:
             clean_pid = pid.split('_')[0]
             if clean_pid in pdb_map:
                 pdb_path = pdb_map[clean_pid]
             else:
-                # Zkusme fuzzy match (např. hledat P27352 kdekoliv v názvu)
                 matches = [f for f in all_pdb_files if clean_pid in os.path.basename(f) and '_pocket_' not in f]
                 if matches:
                     pdb_path = matches[0]
 
         if not pdb_path:
             missing_pdbs += 1
-            # print(f"PDB file not found for {pid}")
             continue
-            
+
         seq = get_full_sequence_from_pdb(pdb_path)
         if not seq:
-            print(f"No valid sequence extracted from {pdb_path}")
+            print(f"Varování: Ze souboru {pdb_path} se nepodařilo extrahovat sekvenci.")
             continue
-            
+
         try:
-            # Extrakce ESM [L, 1280]
-            emb = extractor.extract_embeddings(seq)
+            # Extrakce globálního embeddingu celého proteinu (Mean-Pooling přes rezidua -> [1280])
+            mean_pooled_emb = extractor.extract_sequence_embedding(seq) # torch.FloatTensor [1280]
+            full_embeddings_dict[pid] = mean_pooled_emb
             
-            # Agregace (Mean Pooling) přes celou sekvenci -> získáme 1 vektor [1280] pro celý protein
-            mean_pooled_emb = np.mean(emb, axis=0)
-            
-            # Uložení tenzoru
-            full_embeddings_dict[pid] = torch.FloatTensor(mean_pooled_emb)
+            # Pokud se jedná o fragment (např. P12345_F1), uložíme i základní ID pokud ještě není
+            clean_pid = pid.split('_')[0]
+            if clean_pid not in full_embeddings_dict:
+                full_embeddings_dict[clean_pid] = mean_pooled_emb
+                
+            newly_processed += 1
         except Exception as e:
-            print(f"ESM Extraction failed for {pid}: {e}")
-            
-        # Průběžné ukládání (každých 500)
-        if len(full_embeddings_dict) % 500 == 0:
+            print(f"Chyba při extrakci ESM pro {pid}: {e}")
+
+        # Průběžné ukládání pro ochranu proti přerušení
+        if newly_processed > 0 and newly_processed % args.save_interval == 0:
             torch.save(full_embeddings_dict, out_path)
-            
-    print(f"Successfully processed {len(full_embeddings_dict)} proteins.")
-    if missing_pdbs > 0:
-        print(f"Upozornění: Pro {missing_pdbs} proteinů nebyl nalezen původní PDB soubor.")
-        
+
     torch.save(full_embeddings_dict, out_path)
-    print(f"Saved to {out_path}")
+    print("\n" + "=" * 50)
+    print(f"✅ Hotovo! Celkem uloženo {len(full_embeddings_dict)} proteinových embeddingů do {out_path}")
+    if missing_pdbs > 0:
+        print(f"⚠️ Upozornění: Pro {missing_pdbs} ID nebyl nalezen PDB soubor na disku.")
+    print("=" * 50)
 
 if __name__ == "__main__":
     main()

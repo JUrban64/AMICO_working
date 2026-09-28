@@ -12,9 +12,9 @@ from torch.utils.data import DataLoader
 from sklearn.metrics import f1_score
 
 from dataset import load_cross_mil_data, load_split_ids, match_id, custom_collate_fn
-from model import LigandCrossAttentionMIL
+from model import LigandCrossAttentionMIL, SelfAttentionMIL
 
-def objective(trial, all_bags, train_ids, val_ids, device, epochs=35):
+def objective(trial, all_bags, train_ids, val_ids, device, epochs=35, model_type='ligand_cross_mil'):
     hidden_dim = trial.suggest_categorical('hidden_dim', [128, 256, 512])
     num_heads = trial.suggest_categorical('num_heads', [2, 4, 8])
     lr = trial.suggest_float('lr', 1e-5, 3e-4, log=True)
@@ -35,14 +35,23 @@ def objective(trial, all_bags, train_ids, val_ids, device, epochs=35):
     class_weights = torch.FloatTensor(len(train_labels) / (5.0 * np.maximum(class_counts, 1))).to(device)
 
     criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
-    model = LigandCrossAttentionMIL(
-        feature_dim=1280,
-        ecfp_dim=1024,
-        hidden_dim=hidden_dim,
-        num_heads=num_heads,
-        num_classes=5,
-        dropout=dropout
-    ).to(device)
+    if model_type in ['self_attention_mil', 'self_att']:
+        model = SelfAttentionMIL(
+            feature_dim=1280,
+            hidden_dim=hidden_dim,
+            num_heads=num_heads,
+            num_classes=5,
+            dropout=dropout
+        ).to(device)
+    else:
+        model = LigandCrossAttentionMIL(
+            feature_dim=1280,
+            ecfp_dim=1024,
+            hidden_dim=hidden_dim,
+            num_heads=num_heads,
+            num_classes=5,
+            dropout=dropout
+        ).to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
@@ -99,7 +108,8 @@ def objective(trial, all_bags, train_ids, val_ids, device, epochs=35):
     return best_val_macro_f1
 
 def main():
-    parser = argparse.ArgumentParser(description="Optuna Hyperparameter Search pro LigandCrossAttentionMIL")
+    parser = argparse.ArgumentParser(description="Optuna Hyperparameter Search pro AMICO modely (LigandCrossAttentionMIL / SelfAttentionMIL)")
+    parser.add_argument('--model', type=str, default='ligand_cross_mil', choices=['ligand_cross_mil', 'self_attention_mil', 'self_att'], help='Architektura modelu')
     parser.add_argument('--n-trials', type=int, default=50)
     parser.add_argument('--epochs', type=int, default=35)
     parser.add_argument('--split-suffix', type=str, default='mil_0.5')
@@ -107,8 +117,11 @@ def main():
     parser.add_argument('--full-proteins-path', default='data_prep/esm_full_proteins.pt')
     args = parser.parse_args()
 
+    if args.model == 'self_att':
+        args.model = 'self_attention_mil'
+
     device = torch.device('cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'))
-    print(f"Zařízení: {device}")
+    print(f"Zařízení: {device} | Model: {args.model}")
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
     pockets_path = os.path.join(base_dir, args.pockets_path) if not os.path.isabs(args.pockets_path) else args.pockets_path
@@ -118,9 +131,9 @@ def main():
     train_ids, val_ids, _ = load_split_ids(base_dir, split_suffix=args.split_suffix)
 
     clean_sfx = args.split_suffix.replace('/', '_').replace('.', '_')
-    db_name = f"optuna_ligand_cross_{clean_sfx}.db"
+    db_name = f"optuna_{args.model}_{clean_sfx}.db"
     storage_url = f"sqlite:///{os.path.join(base_dir, db_name)}"
-    study_name = f"ligand_cross_optuna_{clean_sfx}"
+    study_name = f"{args.model}_optuna_{clean_sfx}"
 
     pruner = MedianPruner(n_startup_trials=5, n_warmup_steps=8)
     study = optuna.create_study(
@@ -131,11 +144,12 @@ def main():
         load_if_exists=True
     )
 
-    out_json = os.path.join(base_dir, f"best_params_ligand_cross_{clean_sfx}.json")
+    out_json = os.path.join(base_dir, f"best_params_{args.model}_{clean_sfx}.json")
 
     def save_best_callback(study, trial):
         if study.best_trial.number == trial.number:
             best_dict = {
+                "model": args.model,
                 "best_trial_number": study.best_trial.number,
                 "best_val_macro_f1": study.best_value,
                 "split_suffix": args.split_suffix,
@@ -146,9 +160,9 @@ def main():
                 json.dump(best_dict, f, indent=4)
             print(f"\n>>> Nový nejlepší trial #{trial.number} (Val Macro F1: {study.best_value:.4f}) uložen do {out_json}")
 
-    print(f"\nSpouštím {args.n_trials} trialů (databáze: {db_name})...")
+    print(f"\nSpouštím {args.n_trials} trialů pro {args.model} (databáze: {db_name})...")
     study.optimize(
-        lambda trial: objective(trial, all_bags, train_ids, val_ids, device, epochs=args.epochs),
+        lambda trial: objective(trial, all_bags, train_ids, val_ids, device, epochs=args.epochs, model_type=args.model),
         n_trials=args.n_trials,
         callbacks=[save_best_callback]
     )
@@ -156,6 +170,7 @@ def main():
     print("\n" + "="*50)
     print("      OPTUNA DOKONČENA     ")
     print("="*50)
+    print(f"Model: {args.model}")
     print(f"Nejlepší Val Macro F1: {study.best_value:.4f}")
     print("Nejlepší parametry:")
     for k, v in study.best_params.items():

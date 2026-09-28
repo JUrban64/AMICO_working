@@ -5,16 +5,16 @@ from pathlib import Path
 import torch
 import numpy as np
 
-from model import LigandCrossAttentionMIL, TARGET_NAMES
+from model import LigandCrossAttentionMIL, SelfAttentionMIL, TARGET_NAMES
 from p2rank_utils import run_p2rank, parse_p2rank_output, find_p2rank_executable
 
 class AMICOPredictor:
     """
-    Inferenční třída pro LigandCrossAttentionMIL.
+    Inferenční třída pro modely AMICO (LigandCrossAttentionMIL / SelfAttentionMIL).
     Umožňuje predikovat kofaktor, lokalizovat vazebnou kapsu, odhadovat epistemickou nejistotu 
     pomocí MC Dropoutu a provádět end-to-end inferenci přímo z PDB souboru (P2Rank + ESM-2).
     """
-    def __init__(self, checkpoint_path=None, config_json=None, device=None):
+    def __init__(self, checkpoint_path=None, config_json=None, model_type='auto', device=None):
         if device is None:
             self.device = torch.device('cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'))
         else:
@@ -30,22 +30,55 @@ class AMICOPredictor:
                 hidden_dim = cfg.get('hidden_dim', hidden_dim)
                 num_heads = cfg.get('num_heads', num_heads)
                 dropout = cfg.get('dropout', dropout)
+                if model_type == 'auto' and 'model' in cfg:
+                    model_type = cfg['model']
 
-        self.model = LigandCrossAttentionMIL(
-            feature_dim=1280,
-            ecfp_dim=1024,
-            hidden_dim=hidden_dim,
-            num_heads=num_heads,
-            num_classes=5,
-            dropout=dropout
-        ).to(self.device)
-
+        # Načtení vah a případná automatická detekce architektury
+        loaded_state = None
         if checkpoint_path and os.path.exists(checkpoint_path):
             state = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
-            self.model.load_state_dict(state)
-            print(f"Checkpoint načten z {checkpoint_path}")
+            if isinstance(state, dict):
+                if 'model_state_dict' in state:
+                    state = state['model_state_dict']
+                elif 'state_dict' in state:
+                    state = state['state_dict']
+                # Odstranění případného 'module.' prefixu z DistributedDataParallel
+                state = {k[7:] if k.startswith('module.') else k: v for k, v in state.items()}
+            loaded_state = state
+
+            # Auto detekce architektury podle vah v checkpointu
+            if model_type == 'auto':
+                if 'self_attn.in_proj_weight' in loaded_state:
+                    model_type = 'self_attention_mil'
+                elif 'cross_attn.in_proj_weight' in loaded_state:
+                    model_type = 'ligand_cross_mil'
+
+        # Inicializace zvolené architektury
+        if model_type in ['self_attention_mil', 'self_att']:
+            self.model_type = 'self_attention_mil'
+            self.model = SelfAttentionMIL(
+                feature_dim=1280,
+                hidden_dim=hidden_dim,
+                num_heads=num_heads,
+                num_classes=5,
+                dropout=dropout
+            ).to(self.device)
         else:
-            print("Upozornění: Model inicializován bez načtení checkpointu.")
+            self.model_type = 'ligand_cross_mil'
+            self.model = LigandCrossAttentionMIL(
+                feature_dim=1280,
+                ecfp_dim=1024,
+                hidden_dim=hidden_dim,
+                num_heads=num_heads,
+                num_classes=5,
+                dropout=dropout
+            ).to(self.device)
+
+        if loaded_state is not None:
+            self.model.load_state_dict(loaded_state)
+            print(f"Checkpoint načten z {checkpoint_path} (Architektura: {self.model.__class__.__name__})")
+        else:
+            print(f"Upozornění: Checkpoint '{checkpoint_path}' nenalezen. Model {self.model.__class__.__name__} inicializován bez načtení vah.")
 
         self.model.eval()
         self._esm_extractor = None
@@ -164,9 +197,22 @@ class AMICOPredictor:
             }
 
         # Interpretace vazebných kapes
-        cofactor_attn = used_attn[pred_idx]
-        global_context_weight = float(cofactor_attn[0])
-        pocket_attn_weights = cofactor_attn[1:]
+        if used_attn.ndim == 2 and used_attn.shape[0] == len(TARGET_NAMES):
+            # LigandCrossAttentionMIL: [5, N+1] -> váha pozornosti pro předpovězený kofaktor
+            cofactor_attn = used_attn[pred_idx]
+            global_context_weight = float(cofactor_attn[0])
+            pocket_attn_weights = cofactor_attn[1:]
+        elif used_attn.ndim == 2:
+            # SelfAttentionMIL: [N+1, N+1] -> pozornost CLS proteinového tokenu (index 0) k sobě a kapsám
+            cls_attn = used_attn[0]
+            global_context_weight = float(cls_attn[0])
+            pocket_attn_weights = cls_attn[1:]
+        elif used_attn.ndim == 1:
+            global_context_weight = float(used_attn[0])
+            pocket_attn_weights = used_attn[1:]
+        else:
+            global_context_weight = 0.0
+            pocket_attn_weights = np.array([])
 
         best_pocket_idx = int(np.argmax(pocket_attn_weights)) + 1 if len(pocket_attn_weights) > 0 else None
         best_pocket_weight = float(np.max(pocket_attn_weights)) if len(pocket_attn_weights) > 0 else 0.0
@@ -187,6 +233,7 @@ class AMICOPredictor:
             "mc_samples_used": mc_samples,
             "probabilities": probs_dict,
             "best_binding_pocket": best_pocket_idx if not is_non_binder else None,
+            "raw_best_pocket": best_pocket_idx,
             "best_pocket_attention": round(best_pocket_weight, 4),
             "global_context_weight": round(global_context_weight, 4),
             "pocket_rankings": pocket_rankings
@@ -256,12 +303,21 @@ class AMICOPredictor:
         res['p2rank_output_dir'] = str(out_dir)
 
         best_pid = res['best_binding_pocket']
+        raw_pid = res.get('raw_best_pocket', best_pid)
+
         if best_pid and best_pid in pocket_map:
             res['best_pocket_center'] = pocket_map[best_pid]['center']
             res['best_pocket_name'] = pocket_map[best_pid]['name']
         else:
             res['best_pocket_center'] = [0.0, 0.0, 0.0]
             res['best_pocket_name'] = None
+
+        if raw_pid and raw_pid in pocket_map:
+            res['raw_best_pocket_center'] = pocket_map[raw_pid]['center']
+            res['raw_best_pocket_name'] = pocket_map[raw_pid]['name']
+        else:
+            res['raw_best_pocket_center'] = [0.0, 0.0, 0.0]
+            res['raw_best_pocket_name'] = None
 
         return res
 
@@ -274,18 +330,31 @@ def main():
     parser.add_argument('--min-prob', type=float, default=0.0, help='Minimální pravděpodobnost kapsy z P2Ranku (0.0 = všechny)')
     parser.add_argument('--esm-model', type=str, default='facebook/esm2_t33_650M_UR50D', help='Model ESM-2 z HuggingFace')
 
-    parser.add_argument('--checkpoint', type=str, default='ligand_cross_mil_best.pt', help='Cesta k vahám modelu')
+    parser.add_argument('--model-type', type=str, default='auto', choices=['auto', 'ligand_cross_mil', 'self_attention_mil', 'self_att'], help='Typ architektury modelu (auto, ligand_cross_mil nebo self_attention_mil)')
+    parser.add_argument('--checkpoint', type=str, default=None, help='Cesta k vahám modelu (výchozí: podle typu modelu)')
     parser.add_argument('--config', type=str, default=None, help='Cesta ke konfiguraci JSON (z Optuna tuningu)')
     parser.add_argument('--mc-samples', type=int, default=30, help='Počet MC Dropout vzorků (1 = deterministický, 30 = MC Dropout)')
     parser.add_argument('--confidence-thresh', type=float, default=0.50, help='Minimální jistota pro klasifikaci jako vazač')
     parser.add_argument('--uncertainty-thresh', type=float, default=0.15, help='Maximální rozptyl pro klasifikaci jako vazač')
 
     parser.add_argument('--dock', action='store_true', help='Automaticky nadokovat předpovězený kofaktor do identifikované kapsy')
+    parser.add_argument('--force-dock', action='store_true', help='Vynutit dokování i při nízké jistotě / označení za nevazače')
     parser.add_argument('--pocket-center', nargs=3, type=float, default=None, help='Manuální souřadnice středu kapsy x y z (volitelné)')
     parser.add_argument('--dock-out', type=str, default='docking_results', help='Složka pro uložení výsledků dokování')
     args = parser.parse_args()
 
-    predictor = AMICOPredictor(checkpoint_path=args.checkpoint, config_json=args.config)
+    # Výchozí checkpoint podle modelu, pokud nebyl zadán
+    if args.checkpoint is None:
+        if args.model_type in ['self_attention_mil', 'self_att']:
+            args.checkpoint = 'self_attention_mil_best.pt'
+        elif os.path.exists('ligand_cross_mil_best.pt'):
+            args.checkpoint = 'ligand_cross_mil_best.pt'
+        elif os.path.exists('self_attention_mil_best.pt'):
+            args.checkpoint = 'self_attention_mil_best.pt'
+        else:
+            args.checkpoint = 'ligand_cross_mil_best.pt'
+
+    predictor = AMICOPredictor(checkpoint_path=args.checkpoint, config_json=args.config, model_type=args.model_type)
 
     if args.pdb or args.p2rank_dir:
         # === END-TO-END REŽIM Z PDB NEBO P2RANK VÝSTUPŮ ===
@@ -367,19 +436,22 @@ def main():
         print(p_str)
 
     # Dokování předpovězeného kofaktoru, pokud je vyžádáno
-    if args.dock:
-        if not res['is_confident_prediction']:
-            print("\n[DOCKING SKIP] Dokování přeskočeno: protein byl vyhodnocen jako nevazač.")
+    if args.dock or args.force_dock:
+        if not res['is_confident_prediction'] and not args.force_dock:
+            print("\n[DOCKING SKIP] Dokování přeskočeno: protein byl vyhodnocen jako nevazač (pro vynucení použijte --force-dock nebo upravte prahy).")
         else:
             from docking_utils import dock_predicted_cofactor
 
             pred_cofactor = res['raw_top_class']
             pdb_path = args.pdb if args.pdb else "sample_protein.pdb"
             
+            center = None
             if args.pocket_center:
                 center = np.array(args.pocket_center)
-            elif 'best_pocket_center' in res and sum(abs(x) for x in res['best_pocket_center']) > 1e-4:
+            elif 'best_pocket_center' in res and res['best_pocket_center'] and sum(abs(x) for x in res['best_pocket_center']) > 1e-4:
                 center = np.array(res['best_pocket_center'])
+            elif 'raw_best_pocket_center' in res and res['raw_best_pocket_center'] and sum(abs(x) for x in res['raw_best_pocket_center']) > 1e-4:
+                center = np.array(res['raw_best_pocket_center'])
             else:
                 from docking_utils import get_pocket_center_from_pdb
                 center = get_pocket_center_from_pdb(pdb_path) if os.path.exists(pdb_path) else np.array([0.0, 0.0, 0.0])

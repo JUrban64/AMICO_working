@@ -1,300 +1,464 @@
-import requests
-import os 
-from urllib.parse import quote
+import os
+import re
+import csv
 import time
 import json
-import re
+import requests
 import datetime
 from collections import defaultdict
-from Bio.PDB import PDBParser, PDBIO
+from urllib.parse import quote
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Cesta k ukládání struktur
-structures_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../structures"))
-os.makedirs(structures_dir, exist_ok=True)
-log_file = os.path.join(structures_dir, "run_log.txt")
+# === KONFIGURACE CEST ===
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../structures"))
+PDB_DIR = os.path.join(BASE_DIR, "all_pdbs")
+os.makedirs(PDB_DIR, exist_ok=True)
 
-def write_log(msg, print_to_console=True, write_to_file=True):
-    """Vypíše zprávu do konzole a zároveň ji uloží do logu s časovým razítkem."""
-    if print_to_console:
-        print(msg)
-    if write_to_file:
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with open(log_file, "a", encoding="utf-8") as f:
-            if msg.startswith("=") or msg.strip() == "":
-                f.write(f"{msg}\n")
-            else:
-                f.write(f"[{timestamp}] {msg}\n")
+LOG_FILE = os.path.join(BASE_DIR, "pipeline_50k_no_org_filter.log")
+# Pokud používáte název dataset_metadata.tsv, ponechte takto:
+METADATA_FILE = os.path.join(BASE_DIR, "dataset_metadata.tsv")
+DATASET_CACHE_FILE = os.path.join(BASE_DIR, "master_dataset_cache.json")
 
-write_log("="*60)
-write_log("SPUŠTĚNÍ PIPELINE PRO STAŽENÍ DIVERZIFIKOVANÝCH STRUKTUR")
-write_log("="*60)
-write_log(f"Cílová složka: {structures_dir}")
-
-# Robustní vyhledávací dotazy pro jednotlivé kofaktory v UniProtKB
-QUERIES = {
-    'NAD': '(ft_binding:NAD OR keyword:KW-0524 OR "NAD" AND (cc_cofactor:* OR ft_binding:*))',
-    'ATP': '(ft_binding:ATP OR keyword:KW-0067 OR "ATP" AND (cc_cofactor:* OR ft_binding:*))',
-    'acetyl-CoA': '(ft_binding:"acetyl-CoA" OR keyword:KW-0008 OR "acetyl-CoA" AND (cc_cofactor:* OR ft_binding:*))',
-    'B12': '(chebi:176843 OR keyword:KW-0171 OR "cobalamin" AND (cc_cofactor:* OR ft_binding:*))',
-    'FAD': '(keyword:KW-0274 OR ft_binding:FAD OR "FAD" AND (cc_cofactor:* OR ft_binding:*))'
+TARGET_PER_CLASS = {
+    'B12': 2500,
+    'acetyl-CoA': 6500,
+    'FAD': 10000,
+    'NAD': 14000,
+    'ATP': 17000
 }
 
-def get_next_url_from_link_header(link_header):
-    """Extrahuje URL další stránky (cursor) z HTTP hlavičky 'Link' UniProt REST API."""
-    if not link_header:
-        return None
-    match = re.search(r'<([^>]+)>;\s*rel=["\']?next["\']?', link_header, re.IGNORECASE)
-    return match.group(1) if match else None
+MAX_PER_EC = 40
+MAX_PER_ORG_EC = 1
+MAX_UNASSIGNED_PER_ORG = 1
+MIN_LENGTH = 60
+MAX_LENGTH = 1400
+NUM_WORKERS = 16
 
-def fetch_diverse_uniprots(
-    cofactor, 
-    base_query, 
-    target_count=2500, 
-    max_per_family=35,    # Max 35 proteinů se stejnou Pfam rodinou
-    max_per_organism=3,   # Max 3 proteiny ze stejného organismu
-    page_size=500
-):
-    """
-    Stáhne UniProt ID s důrazem na maximální strukturní a taxonomickou diverzitu:
-    1. Využívá korektní cursorovou paginaci UniProtKB REST API (Link header).
-    2. Prioritizuje manuálně kurátované (Swiss-Prot / reviewed:true) proteiny.
-    3. Doplňuje z TrEMBL, pokud Swiss-Prot nestačí do cílového počtu.
-    4. Kontroluje Pfam rodiny a taxonId organismu.
-    """
-    cache_file = os.path.join(structures_dir, f"uniprot_ids_{cofactor}.json")
-    
-    if os.path.exists(cache_file):
-        with open(cache_file, 'r', encoding='utf-8') as f:
-            cached_ids = json.load(f)
-        if len(cached_ids) >= target_count:
-            write_log(f"  ⚡ [CACHE] Načteno {len(cached_ids)} UniProt ID z lokálního souboru pro {cofactor}.")
-            return cached_ids[:target_count]
+HEADERS = {
+    "User-Agent": "EnzymeCofactorResearch/6.0 (structural screening; contact: user@domain.cz)"
+}
+
+def write_log(msg, print_to_console=True):
+    if print_to_console:
+        print(msg)
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        if msg.startswith("=") or msg.strip() == "":
+            f.write(f"{msg}\n")
         else:
-            write_log(f"  ℹ️ [CACHE] V cache je {len(cached_ids)} ID, požadováno {target_count}, stahuji nový set...")
+            f.write(f"[{timestamp}] {msg}\n")
 
-    write_log(f"  🌐 [API] Stahuji diverzifikované proteiny pro {cofactor} (cíl: {target_count})...")
+SWISSPROT_QUERIES = {
+    'B12': (
+        'reviewed:true AND ('
+        'keyword:KW-0171 OR '
+        'cc_cofactor_chebi:"CHEBI:176843" OR '
+        'cc_cofactor_chebi:"CHEBI:18409" OR '
+        'cc_cofactor_chebi:"CHEBI:25281"'
+        ')'
+    ),
+    'acetyl-CoA': (
+        'reviewed:true AND ('
+        'keyword:KW-0008 OR '
+        'cc_cofactor_chebi:"CHEBI:15351" OR '
+        'ft_binding:"acetyl-CoA"'
+        ')'
+    ),
+    'FAD': (
+        'reviewed:true AND ('
+        'keyword:KW-0274 OR '
+        'cc_cofactor_chebi:"CHEBI:57618" OR '
+        'ft_binding:FAD'
+        ')'
+    ),
+    'NAD': (
+        'reviewed:true AND ('
+        'keyword:KW-0524 OR '
+        'cc_cofactor_chebi:"CHEBI:57540" OR '
+        'cc_cofactor_chebi:"CHEBI:57945" OR '
+        'ft_binding:NAD'
+        ')'
+    ),
+    'ATP': (
+        'reviewed:true AND ('
+        'keyword:KW-0067 OR '
+        'cc_cofactor_chebi:"CHEBI:30616" OR '
+        'ft_binding:ATP'
+        ')'
+    )
+}
+
+TREMBL_QUERIES = {
+    'B12': (
+        'reviewed:false AND fragment:false AND ('
+        'keyword:KW-0171 OR '
+        'xref:interpro-IPR001214 OR '
+        'xref:interpro-IPR006158 OR '
+        'xref:interpro-IPR003711'
+        ')'
+    ),
+    'acetyl-CoA': (
+        'reviewed:false AND fragment:false AND ('
+        'keyword:KW-0008 OR '
+        'xref:interpro-IPR000182 OR '
+        'xref:interpro-IPR016181 OR '
+        'ec:2.3.1.*'
+        ')'
+    ),
+    'FAD': (
+        'reviewed:false AND fragment:false AND ('
+        'keyword:KW-0274 OR '
+        'xref:interpro-IPR001327 OR '
+        'xref:interpro-IPR003952'
+        ')'
+    ),
+    'NAD': (
+        'reviewed:false AND fragment:false AND ('
+        'keyword:KW-0524 OR '
+        'xref:interpro-IPR001709 OR '
+        'xref:interpro-IPR027417'
+        ')'
+    ),
+    'ATP': (
+        'reviewed:false AND fragment:false AND ('
+        'keyword:KW-0067 OR '
+        'ec:2.7.1.* OR ec:2.7.11.*'
+        ')'
+    )
+}
+
+def robust_request(url, max_retries=5, backoff_factor=2, timeout=60):
+    for attempt in range(max_retries):
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=timeout)
+            if resp.status_code == 200:
+                return resp
+            elif resp.status_code in (429, 500, 502, 503, 504):
+                time.sleep(backoff_factor ** attempt)
+            else:
+                return resp
+        except (requests.exceptions.RequestException, requests.exceptions.Timeout):
+            time.sleep(backoff_factor ** attempt)
+    return None
+
+def stream_swissprot(query):
+    fields = "accession,organism_id,length,ec"
+    url = f"https://rest.uniprot.org/uniprotkb/stream?query={quote(query)}&format=tsv&fields={fields}"
+    resp = robust_request(url, timeout=120)
+    if not resp or resp.status_code != 200:
+        return []
+        
+    lines = resp.text.strip().splitlines()
+    if not lines:
+        return []
+        
+    reader = csv.reader(lines, delimiter='\t')
+    headers = [h.strip().lower() for h in next(reader)]
     
-    selected_ids = []
-    family_counts = defaultdict(int)
-    organism_counts = defaultdict(int)
-    seen_ids = set()
+    acc_idx = next((i for i, h in enumerate(headers) if "entry" in h or "accession" in h), 0)
+    org_idx = next((i for i, h in enumerate(headers) if "organism" in h), 1)
+    len_idx = next((i for i, h in enumerate(headers) if "length" in h), 2)
+    ec_idx = next((i for i, h in enumerate(headers) if "ec" in h), 3)
     
-    # 2 fáze: Nejprve kurátovaný Swiss-Prot, poté TrEMBL
-    phases = [
-        ("Swiss-Prot (reviewed)", f"{base_query} AND (reviewed:true)"),
-        ("TrEMBL (unreviewed fallback)", f"{base_query} AND (reviewed:false)")
-    ]
+    parsed = []
+    for row in reader:
+        if not row or len(row) <= max(acc_idx, len_idx):
+            continue
+        length = int(row[len_idx]) if row[len_idx].isdigit() else 0
+        if not (MIN_LENGTH <= length <= MAX_LENGTH):
+            continue
+        ec_val = row[ec_idx].strip() if len(row) > ec_idx else ""
+        parsed.append({
+            "accession": row[acc_idx].strip(),
+            "taxon_id": row[org_idx].strip() if len(row) > org_idx else "unknown",
+            "length": length,
+            "ec": ec_val if ec_val else "unassigned",
+            "source": "Swiss-Prot"
+        })
+    return parsed
+
+def fetch_trembl_paged(query, needed_count, org_ec_counts, ec_counts, unassigned_org_counts):
+    fields = "accession,organism_id,length,ec"
+    url = f"https://rest.uniprot.org/uniprotkb/search?query={quote(query)}&fields={fields}&format=tsv&size=500"
+    added_entries = []
     
-    fields = "accession,reviewed,organism_id,protein_name,xref_pfam"
-    
-    for phase_name, query in phases:
-        if len(selected_ids) >= target_count:
+    while url and len(added_entries) < needed_count:
+        resp = robust_request(url, timeout=45)
+        if not resp or resp.status_code != 200:
             break
             
-        write_log(f"    ↳ Fáze: {phase_name}")
-        encoded_query = quote(query)
-        current_url = f"https://rest.uniprot.org/uniprotkb/search?query={encoded_query}&format=json&fields={fields}&size={page_size}"
-        page_num = 1
+        lines = resp.text.strip().splitlines()
+        if len(lines) <= 1:
+            break
+            
+        reader = csv.reader(lines, delimiter='\t')
+        headers = [h.strip().lower() for h in next(reader)]
         
-        while current_url and len(selected_ids) < target_count:
-            try:
-                response = requests.get(current_url, timeout=30)
-                if response.status_code != 200:
-                    write_log(f"    ❌ Chyba UniProt API: HTTP {response.status_code}")
-                    break
+        acc_idx = next((i for i, h in enumerate(headers) if "entry" in h or "accession" in h), 0)
+        org_idx = next((i for i, h in enumerate(headers) if "organism" in h), 1)
+        len_idx = next((i for i, h in enumerate(headers) if "length" in h), 2)
+        ec_idx = next((i for i, h in enumerate(headers) if "ec" in h), 3)
+        
+        for row in reader:
+            if not row or len(row) <= max(acc_idx, len_idx):
+                continue
+            length = int(row[len_idx]) if row[len_idx].isdigit() else 0
+            if not (MIN_LENGTH <= length <= MAX_LENGTH):
+                continue
                 
-                data = response.json()
-                results = data.get("results", [])
-                
-                if not results:
-                    break
+            acc = row[acc_idx].strip()
+            org = row[org_idx].strip() if len(row) > org_idx else "unknown"
+            ec_val = row[ec_idx].strip() if len(row) > ec_idx else ""
+            primary_ec = ec_val.split(";")[0].strip() if ec_val else "unassigned"
+            
+            if primary_ec != "unassigned":
+                if ec_counts[primary_ec] >= MAX_PER_EC:
+                    continue
+                if org != "unknown" and org_ec_counts[(org, primary_ec)] >= MAX_PER_ORG_EC:
+                    continue
+            else:
+                if org != "unknown" and unassigned_org_counts[org] >= MAX_UNASSIGNED_PER_ORG:
+                    continue
                     
-                added_in_page = 0
-                
-                for item in results:
-                    acc = item.get("primaryAccession")
-                    if not acc or acc in seen_ids:
-                        continue
-                        
-                    # 1. Taxonomický filtr
-                    org_id = item.get("organism", {}).get("taxonId")
-                    if org_id and organism_counts[org_id] >= max_per_organism:
-                        continue
-                        
-                    # 2. Doménový / Pfam rodinný filtr
-                    cross_refs = item.get("uniProtKBCrossReferences", [])
-                    fam_ids = [x["id"] for x in cross_refs if x.get("database") == "Pfam"]
+            if primary_ec != "unassigned":
+                ec_counts[primary_ec] += 1
+                if org != "unknown":
+                    org_ec_counts[(org, primary_ec)] += 1
+            else:
+                if org != "unknown":
+                    unassigned_org_counts[org] += 1
                     
-                    if fam_ids:
-                        # Pokud jsou VŠECHNY jeho Pfam rodiny již zaplněné na max_per_family, přeskočíme
-                        if all(family_counts[fid] >= max_per_family for fid in fam_ids):
-                            continue
-                        for fid in fam_ids:
-                            family_counts[fid] += 1
-                            
-                    # Akceptujeme protein
-                    seen_ids.add(acc)
-                    if org_id:
-                        organism_counts[org_id] += 1
-                    selected_ids.append(acc)
-                    added_in_page += 1
-                    
-                    if len(selected_ids) >= target_count:
-                        break
-                        
-                print(f"      [Strana {page_num:3d}] +{added_in_page:3d} unikátních | Celkem vybráno: {len(selected_ids):4d}/{target_count}")
-                
-                # Získání URL další stránky pomocí cursoru v Link headeru
-                link_header = response.headers.get("Link") or response.headers.get("link")
-                current_url = get_next_url_from_link_header(link_header)
-                page_num += 1
-                time.sleep(0.2)
-                
-            except Exception as e:
-                write_log(f"    ❌ Výjimka při komunikaci s UniProt: {e}")
-                time.sleep(2)
-                # Při chybě spojení zkusíme znovu nebo ukončíme
+            added_entries.append({
+                "accession": acc,
+                "taxon_id": org,
+                "length": length,
+                "ec": ec_val if ec_val else "unassigned",
+                "source": "TrEMBL"
+            })
+            
+            if len(added_entries) >= needed_count:
                 break
                 
-    # Uložení do cache
-    with open(cache_file, 'w', encoding='utf-8') as f:
-        json.dump(selected_ids, f, indent=2)
-    write_log(f"  💾 Uloženo {len(selected_ids)} unikátních proteinů do cache: {cache_file}")
-    
-    return selected_ids
+        link_header = resp.headers.get("Link") or resp.headers.get("link")
+        if not link_header:
+            break
+        match = re.search(r'<([^>]+)>;\s*rel=["\']?next["\']?', link_header, re.IGNORECASE)
+        url = match.group(1) if match else None
+        time.sleep(0.1)
+        
+    return added_entries
 
-def download_alphafold_structures(cofactor, uniprot_ids, max_downloads=None):
-    """Stáhne AlphaFold struktury, kontroluje existenci na disku."""
-    if max_downloads is None:
-        max_downloads = len(uniprot_ids)
+def collect_cofactor_dataset(cofactor, target_count):
+    write_log(f"\n--- Sběr dat: {cofactor} (Cílová kvóta: {target_count}) ---")
+    sp_data = stream_swissprot(SWISSPROT_QUERIES[cofactor])
+    write_log(f"  [Swiss-Prot] Staženo {len(sp_data)} surových záznamů.")
     
-    cofactor_dir = os.path.join(structures_dir, cofactor)
-    os.makedirs(cofactor_dir, exist_ok=True)
+    selected = {}
+    ec_counts = defaultdict(int)
+    org_ec_counts = defaultdict(int)
+    unassigned_org_counts = defaultdict(int)
     
-    downloaded = 0
-    failed = 0
-    skipped = 0
+    for item in sp_data:
+        if len(selected) >= target_count:
+            break
+        org = item["taxon_id"]
+        primary_ec = item["ec"].split(";")[0].strip() if item["ec"] != "unassigned" else "unassigned"
+        
+        if primary_ec != "unassigned":
+            if ec_counts[primary_ec] >= MAX_PER_EC:
+                continue
+            if org != "unknown" and org_ec_counts[(org, primary_ec)] >= MAX_PER_ORG_EC:
+                continue
+        else:
+            if org != "unknown" and unassigned_org_counts[org] >= MAX_UNASSIGNED_PER_ORG:
+                continue
+                
+        if primary_ec != "unassigned":
+            ec_counts[primary_ec] += 1
+            if org != "unknown":
+                org_ec_counts[(org, primary_ec)] += 1
+        else:
+            if org != "unknown":
+                unassigned_org_counts[org] += 1
+                
+        selected[item["accession"]] = item
+        
+    write_log(f"  [Swiss-Prot] Vybráno po funkčním pre-filteru: {len(selected)} enzymů.")
     
-    for i, uniprot_id in enumerate(uniprot_ids[:max_downloads]):
-        existing_files = [f for f in os.listdir(cofactor_dir) if uniprot_id in f and f.endswith('.pdb')]
-        if existing_files:
-            if (i + 1) % 100 == 0:
-                print(f"  [{i+1}/{max_downloads}] ⚡ Kontrola lokální cache ({skipped} již existuje)...")
-            skipped += 1
+    if len(selected) < target_count:
+        needed = target_count - len(selected)
+        write_log(f"  [TrEMBL] Doplňuji {needed} zástupců z unreviewed databáze...")
+        trembl_data = fetch_trembl_paged(
+            TREMBL_QUERIES[cofactor], 
+            needed, 
+            org_ec_counts, 
+            ec_counts, 
+            unassigned_org_counts
+        )
+        for item in trembl_data:
+            selected[item["accession"]] = item
+        write_log(f"  [TrEMBL] Doplněno: +{len(trembl_data)} enzymů.")
+        
+    write_log(f"  🏁 Celkem pro {cofactor}: {len(selected)} enzymů.")
+    return selected
+
+def download_alphafold_pdb(acc, out_dir):
+    """Stáhne PDB z AlphaFold DB pouze v případě, že ještě není na disku."""
+    api_url = f"https://alphafold.ebi.ac.uk/api/prediction/{acc}"
+    resp = robust_request(api_url, timeout=15)
+    
+    if not resp or resp.status_code != 200:
+        return acc, [], "NOT_FOUND" if (resp and resp.status_code == 404) else "ERROR"
+        
+    try:
+        payload = resp.json()
+    except json.JSONDecodeError:
+        return acc, [], "ERROR"
+        
+    saved_pdbs = []
+    for idx, fragment in enumerate(payload, start=1):
+        pdb_url = fragment.get("pdbUrl")
+        if not pdb_url:
             continue
             
-        api_url = f"https://alphafold.ebi.ac.uk/api/prediction/{uniprot_id}"
-        
-        try:
-            response = requests.get(api_url, timeout=15)
-            if response.status_code == 200:
-                data = response.json()
-                for fragment in data:
-                    pdb_url = fragment.get("pdbUrl")
-                    if pdb_url:
-                        pdb_response = requests.get(pdb_url, timeout=20)
-                        if pdb_response.status_code == 200:
-                            filename = os.path.join(cofactor_dir, pdb_url.split("/")[-1])
-                            with open(filename, "wb") as f:
-                                f.write(pdb_response.content)
-                            downloaded += 1
-                        else:
-                            failed += 1
-            elif response.status_code == 404:
-                failed += 1
-            else:
-                failed += 1
-        except Exception as e:
-            write_log(f"    ❌ Chyba stahování AF u {uniprot_id}: {e}")
-            failed += 1
+        frag_resp = robust_request(pdb_url, timeout=25)
+        if not frag_resp or frag_resp.status_code != 200:
+            continue
             
-        if (i + 1) % 50 == 0:
-            print(f"  [{i+1}/{max_downloads}] Nově staženo: {downloaded}, V cache: {skipped}, Selhalo: {failed}")
+        filename = f"{acc}.pdb" if len(payload) == 1 else f"{acc}_F{idx}.pdb"
+        full_path = os.path.join(out_dir, filename)
         
-        time.sleep(0.2)
-    
-    write_log(f"  📊 {cofactor} AF DB report: {downloaded} nově staženo, {skipped} v cache, {failed} selhalo/nenalezeno.")
-    return downloaded, failed, skipped
+        with open(full_path, "wb") as f:
+            f.write(frag_resp.content)
+        saved_pdbs.append(filename)
+        
+    return acc, saved_pdbs, "DOWNLOADED" if saved_pdbs else "FAILED"
 
-def merge_fragments(cofactor_dir, uniprot_id):
-    """
-    Standardizuje názvy stažených AlphaFold souborů:
-    1. Pokud má protein 1 soubor (99 % případů v AF DB): přejmenuje ho na {uniprot_id}_MERGED.pdb pro konzistenci.
-    2. Pokud má protein více fragmentů (AF-F1, AF-F2 u obřích proteinů > 2700 aa):
-       Každý fragment byl predikován AlphaFoldem v samostatném lokálním souřadném systému s překryvem.
-       Ponecháme je jako samostatné domény {uniprot_id}_F1_MERGED.pdb, {uniprot_id}_F2_MERGED.pdb,
-       což zabrání chybnému míchání atomů a zaručí správnou detekci kapes v P2Ranku.
-    """
-    pdb_files = sorted([f for f in os.listdir(cofactor_dir) if uniprot_id in f and f.endswith('.pdb') and not f.endswith('_MERGED.pdb')])
-    
-    if not pdb_files:
-        return 0
-        
-    if len(pdb_files) == 1:
-        merged_filename = os.path.join(cofactor_dir, f"{uniprot_id}_MERGED.pdb")
-        if not os.path.exists(merged_filename):
-            os.rename(os.path.join(cofactor_dir, pdb_files[0]), merged_filename)
-        return 1
-    
-    # Více fragmentů (AlphaFold F1, F2, F3...)
-    processed = 0
-    for i, pdb_file in enumerate(pdb_files, start=1):
-        # Pokusíme se extrahovat číslo fragmentu z původního názvu (např. AF-P12345-F2-model_v4.pdb)
-        frag_match = re.search(r'-F(\d+)-', pdb_file)
-        frag_num = frag_match.group(1) if frag_match else str(i)
-        
-        frag_filename = os.path.join(cofactor_dir, f"{uniprot_id}_F{frag_num}_MERGED.pdb")
-        if not os.path.exists(frag_filename):
-            os.rename(os.path.join(cofactor_dir, pdb_file), frag_filename)
-            processed += 1
+def write_tsv_entry(f_out, acc, pdbs, data):
+    cofactors_str = ";".join(sorted(list(data["cofactors"])))
+    if pdbs:
+        for pdb_file in pdbs:
+            f_out.write(f"{acc}\t{pdb_file}\t{cofactors_str}\t{data['ec']}\t{data['length']}\t{data['source']}\n")
+    else:
+        f_out.write(f"{acc}\tNONE\t{cofactors_str}\t{data['ec']}\t{data['length']}\t{data['source']}\n")
+    f_out.flush()
+
+# === HLAVNÍ BĚH ===
+if __name__ == "__main__":
+    write_log("=" * 65)
+    write_log("START: STAHY S OCHRANOU PROTI PŘERUŠENÍ A DOPLNĚNÍM METADAT")
+    write_log("=" * 65)
+
+    # 1. KROK: Načtení nebo vytvoření master_datasetu
+    master_dataset = {}
+    if os.path.exists(DATASET_CACHE_FILE):
+        write_log(f"Načítám uložený seznam proteinů z cache: {DATASET_CACHE_FILE}")
+        with open(DATASET_CACHE_FILE, "r", encoding="utf-8") as f:
+            cached_data = json.load(f)
+            for acc, entry in cached_data.items():
+                entry["cofactors"] = set(entry["cofactors"])
+                master_dataset[acc] = entry
+        write_log(f"Úspěšně načteno {len(master_dataset)} proteinů z JSON cache.")
+    else:
+        write_log("Cache nenalezena, spouštím dotazy na UniProt...")
+        for cof, target_cnt in TARGET_PER_CLASS.items():
+            subset = collect_cofactor_dataset(cof, target_cnt)
+            for acc, entry in subset.items():
+                if acc not in master_dataset:
+                    master_dataset[acc] = entry
+                    master_dataset[acc]["cofactors"] = {cof}
+                else:
+                    master_dataset[acc]["cofactors"].add(cof)
+                    
+        # Uložení do JSONu pro příští běhy
+        write_log(f"Ukládám sestavený dataset do cache: {DATASET_CACHE_FILE}")
+        serializable = {k: {**v, "cofactors": list(v["cofactors"])} for k, v in master_dataset.items()}
+        with open(DATASET_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(serializable, f)
+
+    # 2. KROK: Analýza existujících souborů na disku a existujícího TSV
+    write_log(f"\n📂 Indexuji lokální soubory v: {PDB_DIR}")
+    disk_pdbs = defaultdict(list)
+    for fname in os.listdir(PDB_DIR):
+        if fname.endswith(".pdb"):
+            fpath = os.path.join(PDB_DIR, fname)
+            # Ignorovat poškozené nebo nulové soubory
+            if os.path.getsize(fpath) > 0:
+                acc_part = fname.split(".")[0].split("_")[0]
+                disk_pdbs[acc_part].append(fname)
+    write_log(f"  • Nalezeno platných PDB na disku pro {len(disk_pdbs)} proteinů.")
+
+    logged_accs = set()
+    tsv_exists = os.path.exists(METADATA_FILE)
+    if tsv_exists:
+        with open(METADATA_FILE, "r", encoding="utf-8") as f:
+            reader = csv.reader(f, delimiter="\t")
+            headers = next(reader, None)
+            for row in reader:
+                if row and len(row) > 0:
+                    logged_accs.add(row[0].strip())
+        write_log(f"  • V TSV souboru {os.path.basename(METADATA_FILE)} již existuje {len(logged_accs)} záznamů.")
+
+    # Otevření TSV pro append režim
+    meta_fp = open(METADATA_FILE, "a", encoding="utf-8")
+    if not tsv_exists or os.path.getsize(METADATA_FILE) == 0:
+        meta_fp.write("uniprot_id\tpdb_file\tcofactors\tec\tlength\tsource\n")
+        meta_fp.flush()
+
+    # 3. KROK: Záchrana dat z disku, která chybí v TSV
+    missing_from_tsv_but_on_disk = 0
+    to_download = []
+
+    for acc, data in master_dataset.items():
+        if acc in logged_accs:
+            continue  # Již kompletně zapsáno v TSV
             
-    return processed
+        if acc in disk_pdbs:
+            # Máme PDB na disku, ale chybělo v TSV -> rovnou zapíšeme bez dotazování sítě
+            write_tsv_entry(meta_fp, acc, disk_pdbs[acc], data)
+            logged_accs.add(acc)
+            missing_from_tsv_but_on_disk += 1
+        else:
+            # Chybí na disku i v TSV -> nutno stáhnout
+            to_download.append(acc)
 
-# === HLAVNÍ SPUŠTĚNÍ ===
+    if missing_from_tsv_but_on_disk > 0:
+        write_log(f"  ⚡ Zpětně doplněno do TSV bez stahování: {missing_from_tsv_but_on_disk} proteinů z disku.")
 
-TARGET_PROTEINS_PER_CLASS = 2500  # Požadovaný počet unikátních struktur na třídu (lze upravit)
-MAX_PER_FAMILY = 35              # Max 35 proteinů ze stejné Pfam domény
-MAX_PER_ORGANISM = 3             # Max 3 proteiny ze stejného druhu
+    write_log(f"\nZbývá reálně stáhnout z AlphaFoldu: {len(to_download)} / {len(master_dataset)} proteinů.")
 
-total_downloaded = 0
-total_failed = 0
-total_skipped = 0
+    # 4. KROK: Paralelní stahování zbývajících položek s průběžným zápisem
+    if to_download:
+        write_log(f"🚀 Spouštím paralelní stahování ({NUM_WORKERS} workerů)...")
+        stats = defaultdict(int)
+        done_counter = 0
+        total_needed = len(to_download)
 
-for cofactor, query in QUERIES.items():
-    write_log(f"\n{'='*50}")
-    write_log(f"Kofaktor: {cofactor}")
-    write_log(f"{'='*50}")
-    
-    # 1. KROK: Získání diverzifikovaných UniProt IDs
-    uniprots = fetch_diverse_uniprots(
-        cofactor=cofactor,
-        base_query=query,
-        target_count=TARGET_PROTEINS_PER_CLASS,
-        max_per_family=MAX_PER_FAMILY,
-        max_per_organism=MAX_PER_ORGANISM
-    )
-    
-    if uniprots:
-        write_log(f"\n=== Stažení AlphaFold struktur pro {cofactor} ===")
-        # 2. KROK: Stahování z AlphaFold DB
-        downloaded, failed, skipped = download_alphafold_structures(cofactor, uniprots, max_downloads=TARGET_PROTEINS_PER_CLASS)
-        
-        # 3. KROK: Sjednocení a úklid
-        cofactor_dir = os.path.join(structures_dir, cofactor)
-        merged_count = 0
-        for uid in uniprots:
-            merged_count += merge_fragments(cofactor_dir, uid)
+        with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
+            future_to_acc = {
+                executor.submit(download_alphafold_pdb, acc, PDB_DIR): acc 
+                for acc in to_download
+            }
             
-        write_log(f"  🧩 Sjednoceno {merged_count} struktur pro {cofactor}.")
-        
-        total_downloaded += downloaded
-        total_failed += failed
-        total_skipped += skipped
+            for future in as_completed(future_to_acc):
+                acc = future_to_acc[future]
+                done_counter += 1
+                
+                try:
+                    _, pdbs, status = future.result()
+                except Exception:
+                    pdbs, status = [], "ERROR"
 
-write_log(f"\n\n{'='*50}")
-write_log("CELKOVÉ SHRNUTÍ DIVERZIFIKOVANÉHO STAHOVÁNÍ")
-write_log(f"{'='*50}")
-write_log(f"✅ Nově staženo z AF DB: {total_downloaded}")
-write_log(f"⚡ Přeskočeno (již na disku): {total_skipped}")
-write_log(f"❌ Selhalo / Nenalezeno v AF DB: {total_failed}")
-write_log("Konec skriptu.\n")
+                stats[status] += 1
+                data = master_dataset[acc]
+                
+                # Okamžitý zápis na disk po každém dokončeném stažení
+                write_tsv_entry(meta_fp, acc, pdbs, data)
+
+                if done_counter % 250 == 0 or done_counter == total_needed:
+                    write_log(f"  [{done_counter:5d}/{total_needed:5d}] Staženo: {stats['DOWNLOADED']:5d} | 404/Chyba: {stats['NOT_FOUND'] + stats['FAILED'] + stats['ERROR']:4d}")
+
+    meta_fp.close()
+    write_log("\n" + "=" * 65)
+    write_log("HOTOVO - Všechna data a metadata jsou kompletní a synchronizovaná.")
+    write_log("=" * 65)

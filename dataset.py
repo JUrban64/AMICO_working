@@ -31,10 +31,11 @@ def load_split_ids(base_dir, split_suffix='_mil_0.5', use_nr=False):
 
 
 def match_id(pid, id_set):
-    """Zkontroluje shodu ID proteinu (včetně ošetření přípon typu _MERGED)."""
-    if pid in id_set:
+    """Zkontroluje shodu ID proteinu (včetně ošetření přípon typu _MERGED, fragmentů _F1 a .pdb)."""
+    clean_p = pid.replace('.pdb', '')
+    if clean_p in id_set:
         return True
-    base = pid.split('_')[0]
+    base = clean_p.split('_')[0]
     return base in id_set
 
 
@@ -57,19 +58,25 @@ def load_cross_mil_data(pockets_path, full_proteins_path, mode='pockets'):
         base_name = os.path.basename(raw_pid)
         pid = base_name.split('_pocket_')[0].replace('.pdb', '').replace('_prank_output', '')
         
+        # Ověření přítomnosti full protein embeddingu (včetně podpory fragmentů _F1)
         if pid not in full_proteins:
-            missing_full_prot += 1
-            continue
+            clean_pid = pid.split('_')[0]
+            if clean_pid in full_proteins:
+                full_proteins[pid] = full_proteins[clean_pid]
+            else:
+                missing_full_prot += 1
+                continue
             
-        feat = item['features'] # [num_residues, 1280]
+        feat = item['features'] # [num_residues, 1280] nebo [1280]
         label = item['label']
         labels_dict[pid] = label
         
         if mode == 'pockets':
-            feat = feat.mean(dim=0)
-            bags_dict[pid].append(feat.numpy())
+            if feat.ndim > 1:
+                feat = feat.mean(dim=0)
+            bags_dict[pid].append(feat.cpu().numpy() if torch.is_tensor(feat) else np.array(feat))
         else:
-            bags_dict[pid].append(feat.numpy())
+            bags_dict[pid].append(feat.cpu().numpy() if torch.is_tensor(feat) else np.array(feat))
             
     if missing_full_prot > 0:
         print(f"Upozornění: U {missing_full_prot} kapes chyběl full protein embedding.")
@@ -81,7 +88,7 @@ def load_cross_mil_data(pockets_path, full_proteins_path, mode='pockets'):
         else:
             pocket_features = torch.FloatTensor(np.concatenate(bags_dict[pid], axis=0))
             
-        full_protein_feat = full_proteins[pid] # [1280]
+        full_protein_feat = full_proteins.get(pid, full_proteins.get(pid.split('_')[0]))
         if isinstance(full_protein_feat, np.ndarray):
             full_protein_feat = torch.FloatTensor(full_protein_feat)
         elif not torch.is_tensor(full_protein_feat):

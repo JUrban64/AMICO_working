@@ -36,9 +36,11 @@ AMICOfin/
 ├── tune_optuna.py                   # Automated Bayesian hyperparameter search (SQLite)
 │
 └── data_prep/
-    ├── two_level_structure_clustering.py # StratifiedGroupKFold cross-fold splitting pipeline
-    ├── structure_clustering.py           # Structure clustering
-    └── generate_full_protein_embeddings.py # ESM-2 sequence embedding generator
+    ├── alphafoldDB_APi.py                # Paralelní stahování struktur z AlphaFold DB & tvorba dataset_metadata.tsv
+    ├── two_level_structure_clustering.py # Dvouúrovňové Foldseek shlukování & StratifiedGroupKFold splitting
+    ├── structure_clustering.py           # Jednoúrovňové strukturní shlukování
+    ├── build_esm_dataset.py              # Extrakce kapes (P2Rank) + ESM-2 embeddingy do esm_dataset.pt
+    └── generate_full_protein_embeddings.py # Generátor ESM-2 celoproteinových embeddingů do esm_full_proteins.pt
 ```
 
 ---

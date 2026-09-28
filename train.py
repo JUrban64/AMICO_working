@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 from sklearn.metrics import accuracy_score, f1_score, classification_report
 
 from dataset import load_cross_mil_data, load_split_ids, match_id, custom_collate_fn, TARGET_NAMES
-from model import LigandCrossAttentionMIL
+from model import LigandCrossAttentionMIL, SelfAttentionMIL
 
 class EarlyStopping:
     def __init__(self, patience=12, min_delta=0.0):
@@ -34,7 +34,8 @@ class EarlyStopping:
         return self.early_stop
 
 def main():
-    parser = argparse.ArgumentParser(description="Trénování finálního LigandCrossAttentionMIL modelu")
+    parser = argparse.ArgumentParser(description="Trénování modelů AMICO (LigandCrossAttentionMIL / SelfAttentionMIL)")
+    parser.add_argument('--model', type=str, default='ligand_cross_mil', choices=['ligand_cross_mil', 'self_attention_mil', 'self_att'], help='Architektura modelu (ligand_cross_mil nebo self_attention_mil)')
     parser.add_argument('--config-json', type=str, default=None, help='Cesta k JSON s nejlepšími parametry z Optuny')
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--lr', type=float, default=4.86e-5)
@@ -48,8 +49,15 @@ def main():
     parser.add_argument('--split-suffix', type=str, default='mil_0.5')
     parser.add_argument('--pockets-path', default='data_prep/esm_dataset.pt')
     parser.add_argument('--full-proteins-path', default='data_prep/esm_full_proteins.pt')
-    parser.add_argument('--save-model', type=str, default='ligand_cross_mil_best.pt')
+    parser.add_argument('--save-model', type=str, default=None, help='Cesta pro uložení modelu (výchozí podle vybraného typu modelu)')
     args = parser.parse_args()
+
+    # Normalizace názvu modelu
+    if args.model == 'self_att':
+        args.model = 'self_attention_mil'
+
+    if args.save_model is None:
+        args.save_model = 'self_attention_mil_best.pt' if args.model == 'self_attention_mil' else 'ligand_cross_mil_best.pt'
 
     # Načtení Optuna konfigurace, pokud je zadána
     if args.config_json and os.path.exists(args.config_json):
@@ -101,14 +109,23 @@ def main():
     class_weights = torch.FloatTensor(len(train_labels) / (5.0 * np.maximum(class_counts, 1))).to(device)
 
     criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=args.label_smoothing)
-    model = LigandCrossAttentionMIL(
-        feature_dim=1280,
-        ecfp_dim=1024,
-        hidden_dim=args.hidden_dim,
-        num_heads=args.num_heads,
-        num_classes=5,
-        dropout=args.dropout
-    ).to(device)
+    if args.model == 'self_attention_mil':
+        model = SelfAttentionMIL(
+            feature_dim=1280,
+            hidden_dim=args.hidden_dim,
+            num_heads=args.num_heads,
+            num_classes=5,
+            dropout=args.dropout
+        ).to(device)
+    else:
+        model = LigandCrossAttentionMIL(
+            feature_dim=1280,
+            ecfp_dim=1024,
+            hidden_dim=args.hidden_dim,
+            num_heads=args.num_heads,
+            num_classes=5,
+            dropout=args.dropout
+        ).to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=4)
@@ -132,7 +149,8 @@ def main():
         rep = classification_report(truths, preds, target_names=TARGET_NAMES, output_dict=True, zero_division=0) if len(truths) > 0 else {}
         return loss_sum / max(len(truths), 1), acc, f1_m, rep
 
-    print("\n--- Spouštím trénování LigandCrossAttentionMIL ---")
+    model_class_name = model.__class__.__name__
+    print(f"\n--- Spouštím trénování {model_class_name} ({args.model}) | Ukládání do: {args.save_model} ---")
     best_val_loss = float('inf')
     best_weights = None
 

@@ -13,7 +13,86 @@ def create_alias_pdb(src_pdb, dst_pdb):
     """Vytvoří fyzickou kopii (symlinky mohou dělat problémy na HPC/v kontejnerech)."""
     shutil.copy2(src_pdb, dst_pdb)
 
-def cluster_structures(target='both', test_limit=None, tmscore_threshold=0.5, nr_threshold=None):
+def load_metadata_labels(metadata_path=None, candidate_roots=None):
+    """
+    Načte mapování protein ID / pdb_file -> cofactor label (0-4) z dataset_metadata.tsv nebo master_dataset_cache.json.
+    """
+    target_names = ['acetyl-CoA', 'ATP', 'B12', 'FAD', 'NAD']
+    name_to_label = {name: str(i) for i, name in enumerate(target_names)}
+    metadata_labels = {}
+    found_path = None
+    
+    candidates = []
+    if metadata_path:
+        candidates.append(metadata_path)
+        
+    cwd = os.getcwd()
+    search_dirs = [
+        os.path.join(script_dir, 'structures'),
+        os.path.join(script_dir, '..', 'structures'),
+        os.path.join(cwd, 'structures'),
+        os.path.join(cwd, '..', 'structures'),
+        os.path.join(cwd, 'data_prep', 'structures')
+    ]
+    if candidate_roots:
+        search_dirs.extend(candidate_roots)
+        
+    for d in search_dirs:
+        candidates.append(os.path.join(d, 'dataset_metadata.tsv'))
+        candidates.append(os.path.join(d, 'master_dataset_cache.json'))
+        
+    for cand in candidates:
+        if cand and os.path.exists(cand) and os.path.getsize(cand) > 0:
+            found_path = cand
+            break
+            
+    if not found_path:
+        return {}
+        
+    print(f"-> Načítám metadata a anotace kofaktorů z: {found_path}")
+    if found_path.endswith('.tsv') or found_path.endswith('.txt'):
+        import csv
+        with open(found_path, 'r', encoding='utf-8') as f:
+            reader = csv.reader(f, delimiter='\t')
+            headers = next(reader, None)
+            for row in reader:
+                if not row or len(row) < 3:
+                    continue
+                acc = row[0].strip()
+                pdb_file = row[1].strip()
+                cofactors_str = row[2].strip()
+                
+                cofactors_list = [c.strip() for c in cofactors_str.split(';') if c.strip()]
+                assigned_label = None
+                for cof in cofactors_list:
+                    if cof in name_to_label:
+                        assigned_label = name_to_label[cof]
+                        break
+                        
+                if assigned_label is not None:
+                    if pdb_file and pdb_file != 'NONE':
+                        pid_stem = pdb_file.replace('.pdb', '').strip()
+                        metadata_labels[pid_stem] = assigned_label
+                    metadata_labels[acc] = assigned_label
+    elif found_path.endswith('.json'):
+        with open(found_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            for acc, entry in data.items():
+                cofs = entry.get('cofactors', [])
+                if isinstance(cofs, str):
+                    cofs = [cofs]
+                assigned_label = None
+                for cof in cofs:
+                    if cof in name_to_label:
+                        assigned_label = name_to_label[cof]
+                        break
+                if assigned_label is not None:
+                    metadata_labels[acc] = assigned_label
+                    
+    print(f"-> Úspěšně načteno {len(metadata_labels)} záznamů s kofaktory z metadat.")
+    return metadata_labels
+
+def cluster_structures(target='both', test_limit=None, tmscore_threshold=0.5, nr_threshold=None, metadata_file=None):
     cwd = os.getcwd()
     if target == 'binding_sites':
         pdb_roots = [
@@ -22,15 +101,22 @@ def cluster_structures(target='both', test_limit=None, tmscore_threshold=0.5, nr
         ]
     elif target == 'structures':
         pdb_roots = [
-            os.path.join(script_dir, 'structures'), os.path.join(script_dir, '..', 'structures'),
-            os.path.join(cwd, 'structures'), os.path.join(cwd, '..', 'structures')
+            os.path.join(script_dir, 'structures'), os.path.join(script_dir, 'structures', 'all_pdbs'),
+            os.path.join(script_dir, '..', 'structures'), os.path.join(script_dir, '..', 'structures', 'all_pdbs'),
+            os.path.join(cwd, 'structures'), os.path.join(cwd, 'structures', 'all_pdbs'),
+            os.path.join(cwd, '..', 'structures'), os.path.join(cwd, '..', 'structures', 'all_pdbs'),
+            os.path.join(cwd, 'data_prep', 'structures', 'all_pdbs')
         ]
     else:
         pdb_roots = [
             os.path.join(script_dir, 'Binding_Sites'), os.path.join(script_dir, '..', 'Binding_Sites'),
-            os.path.join(script_dir, 'structures'), os.path.join(script_dir, '..', 'structures'),
-            os.path.join(cwd, 'Binding_Sites'), os.path.join(cwd, 'structures')
+            os.path.join(script_dir, 'structures'), os.path.join(script_dir, 'structures', 'all_pdbs'),
+            os.path.join(script_dir, '..', 'structures'), os.path.join(script_dir, '..', 'structures', 'all_pdbs'),
+            os.path.join(cwd, 'Binding_Sites'), os.path.join(cwd, 'structures'),
+            os.path.join(cwd, 'structures', 'all_pdbs'), os.path.join(cwd, 'data_prep', 'structures', 'all_pdbs')
         ]
+    
+    metadata_labels = load_metadata_labels(metadata_path=metadata_file, candidate_roots=pdb_roots)
     
     pdb_files = []
     for root in pdb_roots:
@@ -54,7 +140,6 @@ def cluster_structures(target='both', test_limit=None, tmscore_threshold=0.5, nr
             base_id = os.path.basename(pdb_file).replace(".pdb", "")
             
             if base_id in pdb_data:
-                print(f"Warning: duplicate ID '{base_id}', skipping {pdb_file}")
                 continue
                 
             alias_pdb = os.path.join(tmp_pdb_dir, f"{base_id}.pdb")
@@ -64,28 +149,34 @@ def cluster_structures(target='both', test_limit=None, tmscore_threshold=0.5, nr
         print(f"Loaded {len(pdb_data)} unique PDB structures")
         if len(pdb_data) == 0:
             print("No PDBs found.")
-            return None, None, None
+            return None, None, None, None
         
         target_names = ['acetyl-CoA', 'ATP', 'B12', 'FAD', 'NAD']
         name_to_label = {name: str(i) for i, name in enumerate(target_names)}
         
-        labels_by_pid = {}
-        for pid, path in pdb_data.items():
-            # Musíme dohledat originální cestu k PDB, pdb_data obsahuje cesty do temp diru,
-            # takže použijeme původní pdb_files pole k nalezení originální cesty.
-            pass
-            
-        # Vytvoříme si mapu z originálních PDB
+        # Vytvoříme si mapu z metadat a originálních PDB
         orig_labels_by_pid = {}
         for p in pdb_files:
             pid = os.path.basename(p).replace(".pdb", "")
-            parts = os.path.normpath(p).split(os.sep)
-            for part in reversed(parts):
-                if part in name_to_label:
-                    orig_labels_by_pid[pid] = name_to_label[part]
-                    break
+            
+            # 1. Priorita: Metadata
+            if pid in metadata_labels:
+                orig_labels_by_pid[pid] = metadata_labels[pid]
+            elif pid.split('_')[0] in metadata_labels:
+                orig_labels_by_pid[pid] = metadata_labels[pid.split('_')[0]]
+            else:
+                # 2. Fallback: Názvy složek
+                parts = os.path.normpath(p).split(os.sep)
+                for part in reversed(parts):
+                    if part in name_to_label:
+                        orig_labels_by_pid[pid] = name_to_label[part]
+                        break
         
         labels_by_pid = orig_labels_by_pid
+        
+        unlabeled = [pid for pid in pdb_data.keys() if labels_by_pid.get(pid, '-1') == '-1']
+        if unlabeled:
+            print(f"⚠️ Upozornění: {len(unlabeled)} / {len(pdb_data)} struktur nemá přiřazenou třídu kofaktoru (label -1).")
             
         fs_out_prefix = os.path.join(tmp_dir, "fs_out")
         fs_tmp_dir = os.path.join(tmp_dir, "fs_tmp")
@@ -252,6 +343,8 @@ def cluster_structures(target='both', test_limit=None, tmscore_threshold=0.5, nr
 if __name__ == "__main__":
     # Nastavení argparse
     parser = argparse.ArgumentParser(description="Cluster PDB structures using Foldseek.")
+    parser.add_argument("--metadata", default=None,
+                        help="Cesta k dataset_metadata.tsv nebo master_dataset_cache.json pro anotace tříd kofaktorů.")
     parser.add_argument("--test", action="store_true", help="Omezí počet PDB souborů na 30 pro rychlé testování.")
     parser.add_argument("--target", choices=["binding_sites", "structures", "both"], default="structures", 
                         help="Co se má clustrovat: 'binding_sites' pro trénink E3, 'structures' pro MIL klasifikátor, nebo 'both'.")
@@ -269,7 +362,8 @@ if __name__ == "__main__":
         target=args.target, 
         test_limit=limit, 
         tmscore_threshold=args.tmscore_threshold,
-        nr_threshold=args.nr_threshold
+        nr_threshold=args.nr_threshold,
+        metadata_file=args.metadata
     )
 
     if train is not None:

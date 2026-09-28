@@ -79,8 +79,89 @@ def extract_pocket_from_entry(entry, full_pdb_path, out_pocket_pdb):
 
     return False
 
-def find_pdb_files(pdb_roots, test_limit=None):
+def load_metadata_labels(metadata_path=None, candidate_roots=None):
+    """
+    Načte mapování protein ID / pdb_file -> cofactor label (0-4) z dataset_metadata.tsv nebo master_dataset_cache.json.
+    Vrací slovník {pdb_id: label_str} a {uniprot_id: label_str}.
+    """
+    metadata_labels = {}
+    found_path = None
+    
+    candidates = []
+    if metadata_path:
+        candidates.append(metadata_path)
+        
+    cwd = os.getcwd()
+    search_dirs = [
+        os.path.join(script_dir, 'structures'),
+        os.path.join(script_dir, '..', 'structures'),
+        os.path.join(cwd, 'structures'),
+        os.path.join(cwd, '..', 'structures'),
+        os.path.join(cwd, 'data_prep', 'structures')
+    ]
+    if candidate_roots:
+        search_dirs.extend(candidate_roots)
+        
+    for d in search_dirs:
+        candidates.append(os.path.join(d, 'dataset_metadata.tsv'))
+        candidates.append(os.path.join(d, 'master_dataset_cache.json'))
+        
+    for cand in candidates:
+        if cand and os.path.exists(cand) and os.path.getsize(cand) > 0:
+            found_path = cand
+            break
+            
+    if not found_path:
+        return {}
+        
+    print(f"-> Načítám metadata a anotace kofaktorů z: {found_path}")
+    if found_path.endswith('.tsv') or found_path.endswith('.txt'):
+        import csv
+        with open(found_path, 'r', encoding='utf-8') as f:
+            reader = csv.reader(f, delimiter='\t')
+            headers = next(reader, None)
+            for row in reader:
+                if not row or len(row) < 3:
+                    continue
+                acc = row[0].strip()
+                pdb_file = row[1].strip()
+                cofactors_str = row[2].strip()
+                
+                cofactors_list = [c.strip() for c in cofactors_str.split(';') if c.strip()]
+                assigned_label = None
+                for cof in cofactors_list:
+                    if cof in NAME_TO_LABEL:
+                        assigned_label = NAME_TO_LABEL[cof]
+                        break
+                        
+                if assigned_label is not None:
+                    if pdb_file and pdb_file != 'NONE':
+                        pid_stem = pdb_file.replace('.pdb', '').strip()
+                        metadata_labels[pid_stem] = assigned_label
+                    metadata_labels[acc] = assigned_label
+    elif found_path.endswith('.json'):
+        with open(found_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            for acc, entry in data.items():
+                cofs = entry.get('cofactors', [])
+                if isinstance(cofs, str):
+                    cofs = [cofs]
+                assigned_label = None
+                for cof in cofs:
+                    if cof in NAME_TO_LABEL:
+                        assigned_label = NAME_TO_LABEL[cof]
+                        break
+                if assigned_label is not None:
+                    metadata_labels[acc] = assigned_label
+                    
+    print(f"-> Úspěšně načteno {len(metadata_labels)} záznamů s kofaktory z metadat.")
+    return metadata_labels
+
+def find_pdb_files(pdb_roots, test_limit=None, metadata_labels=None):
     """Najde všechny plné PDB soubory a fyzické soubory kapes."""
+    if metadata_labels is None:
+        metadata_labels = {}
+
     full_pdb_files = {}
     pocket_pdb_files = {}
     labels_by_pid = {}
@@ -92,14 +173,20 @@ def find_pdb_files(pdb_roots, test_limit=None):
             fname = os.path.basename(p)
             base_id = fname.replace('.pdb', '')
             
-            # Detekce třídy z cesty
-            parts = os.path.normpath(p).split(os.sep)
+            # 1. Priorita: Anotace z metadat (dataset_metadata.tsv / master_dataset_cache.json)
             label = '-1'
-            for part in reversed(parts):
-                clean_part = part.replace('_prank_output', '')
-                if clean_part in NAME_TO_LABEL:
-                    label = NAME_TO_LABEL[clean_part]
-                    break
+            if base_id in metadata_labels:
+                label = metadata_labels[base_id]
+            elif base_id.split('_')[0] in metadata_labels:
+                label = metadata_labels[base_id.split('_')[0]]
+            else:
+                # 2. Fallback: Detekce třídy z cesty ke složce
+                parts = os.path.normpath(p).split(os.sep)
+                for part in reversed(parts):
+                    clean_part = part.replace('_prank_output', '')
+                    if clean_part in NAME_TO_LABEL:
+                        label = NAME_TO_LABEL[clean_part]
+                        break
             
             if '_pocket' in fname or '_pocket_' in p or 'prank_output' in p:
                 pocket_pdb_files[p] = p
@@ -124,19 +211,25 @@ def two_level_structure_clustering(
     suffix=None,
     test_limit=None,
     nr_threshold=None,
-    threads=8
+    threads=8,
+    metadata_file=None
 ):
     cwd = os.getcwd()
     pdb_roots = [
         os.path.join(script_dir, 'structures'),
+        os.path.join(script_dir, 'structures', 'all_pdbs'),
         os.path.join(script_dir, '..', 'structures'),
+        os.path.join(script_dir, '..', 'structures', 'all_pdbs'),
         os.path.join(script_dir, 'Binding_Sites'),
         os.path.join(script_dir, '..', 'Binding_Sites'),
         os.path.join(cwd, 'structures'),
+        os.path.join(cwd, 'structures', 'all_pdbs'),
         os.path.join(cwd, '..', 'structures'),
+        os.path.join(cwd, '..', 'structures', 'all_pdbs'),
         os.path.join(cwd, 'Binding_Sites'),
         os.path.join(cwd, '..', 'Binding_Sites'),
         os.path.join(cwd, 'data_prep', 'structures'),
+        os.path.join(cwd, 'data_prep', 'structures', 'all_pdbs'),
         os.path.join(cwd, 'data_prep', 'Binding_Sites')
     ]
     
@@ -153,11 +246,19 @@ def two_level_structure_clustering(
     print(f"Výstupní suffix: {suffix}")
     print("========================================================\n")
     
-    full_pdb_files, pocket_pdb_files, labels_by_pid = find_pdb_files(pdb_roots, test_limit=test_limit)
+    metadata_labels = load_metadata_labels(metadata_path=metadata_file, candidate_roots=pdb_roots)
+    full_pdb_files, pocket_pdb_files, labels_by_pid = find_pdb_files(pdb_roots, test_limit=test_limit, metadata_labels=metadata_labels)
     print(f"Nalezeno {len(full_pdb_files)} unikátních plných PDB struktur.")
     if len(full_pdb_files) == 0:
         print("Chyba: Nebyly nalezeny žádné PDB soubory.")
         return None, None, None, None
+
+    # Kontrola anotací kofaktorů
+    unlabeled = [pid for pid, lbl in labels_by_pid.items() if lbl == '-1']
+    if unlabeled:
+        print(f"⚠️ Upozornění: {len(unlabeled)} / {len(full_pdb_files)} struktur nemá přiřazenou třídu kofaktoru (label -1).")
+        if len(unlabeled) == len(full_pdb_files):
+            print("❌ Chyba: Žádná struktura nemá přiřazený kofaktor. Zkontrolujte prosím přítomnost dataset_metadata.tsv nebo použijte argument --metadata.")
 
     sorted_pids = sorted(list(full_pdb_files.keys()))
     pid_to_idx = {pid: i for i, pid in enumerate(sorted_pids)}
@@ -448,6 +549,8 @@ def two_level_structure_clustering(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Dvouúrovňové strukturní shlukování pomocí Foldseek (celý protein + kapsy).")
+    parser.add_argument("--metadata", default=None,
+                        help="Cesta k dataset_metadata.tsv nebo master_dataset_cache.json pro anotace tříd kofaktorů.")
     parser.add_argument("--full-tmscore-threshold", "--full-tmscore", type=float, default=0.5,
                         help="Práh TM-score pro globální shlukování plných struktur (default: 0.5).")
     parser.add_argument("--pocket-tmscore-threshold", "--pocket-tmscore", type=float, default=0.5,
@@ -473,5 +576,6 @@ if __name__ == "__main__":
         suffix=args.suffix,
         test_limit=30 if args.test else None,
         nr_threshold=args.nr_threshold,
-        threads=args.threads
+        threads=args.threads,
+        metadata_file=args.metadata
     )
