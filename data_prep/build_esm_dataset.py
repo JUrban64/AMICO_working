@@ -86,7 +86,10 @@ def main():
     parser.add_argument('--chunk-size', type=int, default=500, help='Velikost dávky pro dávkový běh P2Ranku')
     parser.add_argument('--esm-model', type=str, default='facebook/esm2_t33_650M_UR50D', help='Model ESM-2')
     parser.add_argument('--device', type=str, default=None, help='Zařízení pro ESM (cuda, mps, cpu)')
-    parser.add_argument('--min-prob', type=float, default=0.0, help='Minimální pravděpodobnost kapsy z P2Ranku')
+    parser.add_argument('--min-prob', type=float, default=0.30, help='Minimální pravděpodobnost kapsy z P2Ranku')
+    parser.add_argument('--skip-p2rank', action='store_true', help='Přeskočit spouštění P2Ranku (použít pouze již vygenerované CSV predikce)')
+    parser.add_argument('--pockets-only', action='store_true', help='Generovat pouze esm_dataset.pt (bez celoproteinových embeddingů)')
+    parser.add_argument('--full-only', action='store_true', help='Generovat pouze esm_full_proteins.pt (bez kapes)')
     parser.add_argument('--save-interval', type=int, default=100, help='Interval ukládání checkpointu')
     parser.add_argument('--limit', type=int, default=None, help='Omezit počet zpracovaných proteinů pro testování')
     args = parser.parse_args()
@@ -103,6 +106,8 @@ def main():
     print(f"Pockets výstup:{args.pockets_out}")
     print(f"Full výstup:   {args.full_proteins_out}")
     print(f"P2Rank vláken: {args.threads} | Config: {args.config} | Chunk: {args.chunk_size}")
+    if args.skip_p2rank:
+        print("⚡ P2Rank běh:  PŘESKOČEN (použijí se existující CSV)")
     print("=" * 65)
 
     # 1. Načtení metadat
@@ -143,14 +148,18 @@ def main():
     if metadata_targets:
         for pdb_fname, meta in metadata_targets.items():
             stem = meta['stem']
-            if stem in processed_pids and stem in full_proteins_dict:
+            need_pockets = (not args.full_only) and (stem not in processed_pids)
+            need_full = (not args.pockets_only) and (stem not in full_proteins_dict)
+            if not need_pockets and not need_full:
                 continue
             if stem in pdb_by_stem:
                 queue.append((pdb_by_stem[stem], meta))
     else:
         for f in all_pdb_files:
             stem = f.stem
-            if stem in processed_pids and stem in full_proteins_dict:
+            need_pockets = (not args.full_only) and (stem not in processed_pids)
+            need_full = (not args.pockets_only) and (stem not in full_proteins_dict)
+            if not need_pockets and not need_full:
                 continue
             meta = {
                 'uniprot_id': stem.split('_')[0],
@@ -172,24 +181,25 @@ def main():
         print(f"-> Zbývá ke zpracování: {len(queue)} struktur.")
 
     if not queue:
-        print("✅ Všechny struktury jsou již kompletně zpracovány.")
+        print("✅ Všechny požadované struktury jsou již kompletně zpracovány.")
         return
 
-    # Ověření dostupnosti P2Ranku
-    prank_bin = find_p2rank_executable(args.prank_exec)
-    print(f"-> Používám P2Rank binárku: {prank_bin}")
-
-    # 4. Spuštění P2Rank v dávkovém režimu pro všechny nezpracované struktury
-    queue_pdb_paths = [pdb_path for pdb_path, _ in queue]
-    print(f"\n🚀 Spouštím hromadnou predikci kapes P2Rank pro {len(queue_pdb_paths)} struktur...")
-    run_p2rank_batch(
-        queue_pdb_paths,
-        prank_exec=prank_bin,
-        output_dir=args.prank_out_dir,
-        config=args.config,
-        threads=args.threads,
-        chunk_size=args.chunk_size
-    )
+    # 4. Spuštění P2Rank v dávkovém režimu (pokud není přeskočen)
+    if not args.skip_p2rank and not args.full_only:
+        prank_bin = find_p2rank_executable(args.prank_exec)
+        print(f"-> Používám P2Rank binárku: {prank_bin}")
+        queue_pdb_paths = [pdb_path for pdb_path, _ in queue]
+        print(f"\n🚀 Spouštím hromadnou predikci kapes P2Rank pro {len(queue_pdb_paths)} struktur...")
+        run_p2rank_batch(
+            queue_pdb_paths,
+            prank_exec=prank_bin,
+            output_dir=args.prank_out_dir,
+            config=args.config,
+            threads=args.threads,
+            chunk_size=args.chunk_size
+        )
+    elif args.skip_p2rank and not args.full_only:
+        print(f"\n⚡ Přeskakuji spouštění P2Ranku (--skip-p2rank). Použijí se existující CSV predikce z {args.prank_out_dir}")
 
     # 5. Inicializace ESM extraktoru pro výpočet embeddingů
     print("\n-> Inicializuji ESM Feature Extractor...")
@@ -204,40 +214,40 @@ def main():
         label = meta['label']
 
         try:
-            # Parsování kapes z výstupů P2Ranku
-            parsed = parse_p2rank_output(args.prank_out_dir, pdb_path, min_prob=args.min_prob)
-            full_seq = parsed['full_sequence']
-            pockets = parsed['pockets']
+            # Extrakce full protein embeddingu (pokud není vyžádáno pouze pockets-only)
+            if not args.pockets_only and stem not in full_proteins_dict:
+                from Bio.PDB import PDBParser
+                from p2rank_utils import get_full_sequence_from_pdb
+                full_seq, _, _ = get_full_sequence_from_pdb(pdb_path)
+                if full_seq:
+                    full_emb = extractor.extract_sequence_embedding(full_seq) # [1280]
+                    full_proteins_dict[stem] = full_emb
+                    clean_acc = stem.split('_')[0]
+                    if clean_acc not in full_proteins_dict:
+                        full_proteins_dict[clean_acc] = full_emb
 
-            # Extrakce full protein embeddingu
-            if stem not in full_proteins_dict:
-                full_emb = extractor.extract_sequence_embedding(full_seq) # [1280]
-                full_proteins_dict[stem] = full_emb
-                clean_acc = stem.split('_')[0]
-                if clean_acc not in full_proteins_dict:
-                    full_proteins_dict[clean_acc] = full_emb
-
-            # D. Extrakce pocket embeddingů
-            pocket_seqs = [p['sequence'] for p in pockets if p.get('sequence')]
-            if pocket_seqs:
-                pocket_embs = extractor.extract_pocket_embeddings(pocket_seqs) # [N, 1280]
-                
-                valid_idx = 0
-                for p_info in pockets:
-                    if not p_info.get('sequence'):
-                        continue
-                    p_feat = pocket_embs[valid_idx] # [1280]
-                    valid_idx += 1
-                    
-                    new_pockets_list.append({
-                        'protein_id': f"{stem}_pocket_{p_info['pocket_id']}.pdb",
-                        'features': p_feat,
-                        'label': label,
-                        'probability': p_info.get('probability', 0.0),
-                        'score': p_info.get('score', 0.0),
-                        'center': p_info.get('center', [0.0, 0.0, 0.0]),
-                        'residue_count': p_info.get('residue_count', len(p_info.get('sequence', '')))
-                    })
+            # Parsování kapes a extrakce pocket embeddingů (pokud není vyžádáno pouze full-only)
+            if not args.full_only:
+                parsed = parse_p2rank_output(args.prank_out_dir, pdb_path, min_prob=args.min_prob)
+                pockets = parsed['pockets']
+                pocket_seqs = [p['sequence'] for p in pockets if p.get('sequence')]
+                if pocket_seqs:
+                    pocket_embs = extractor.extract_pocket_embeddings(pocket_seqs) # [N, 1280]
+                    valid_idx = 0
+                    for p_info in pockets:
+                        if not p_info.get('sequence'):
+                            continue
+                        p_feat = pocket_embs[valid_idx] # [1280]
+                        valid_idx += 1
+                        new_pockets_list.append({
+                            'protein_id': f"{stem}_pocket_{p_info['pocket_id']}.pdb",
+                            'features': p_feat,
+                            'label': label,
+                            'probability': p_info.get('probability', 0.0),
+                            'score': p_info.get('score', 0.0),
+                            'center': p_info.get('center', [0.0, 0.0, 0.0]),
+                            'residue_count': p_info.get('residue_count', len(p_info.get('sequence', '')))
+                        })
 
             new_counter += 1
 

@@ -39,7 +39,8 @@ AMICOfin/
     ├── alphafoldDB_APi.py                # Paralelní stahování struktur z AlphaFold DB & tvorba dataset_metadata.tsv
     ├── two_level_structure_clustering.py # Dvouúrovňové Foldseek shlukování & StratifiedGroupKFold splitting
     ├── structure_clustering.py           # Jednoúrovňové strukturní shlukování
-    ├── build_esm_dataset.py              # Extrakce kapes (P2Rank) + ESM-2 embeddingy do esm_dataset.pt
+    ├── build_esm_dataset.py              # All-in-one: P2Rank dávka + ESM-2 embeddingy do esm_dataset.pt & esm_full_proteins.pt
+    ├── generate_pocket_embeddings.py     # Generátor esm_dataset.pt z již hotových P2Rank výstupů
     └── generate_full_protein_embeddings.py # Generátor ESM-2 celoproteinových embeddingů do esm_full_proteins.pt
 ```
 
