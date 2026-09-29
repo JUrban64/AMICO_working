@@ -12,6 +12,29 @@ def load_split_ids(base_dir, split_suffix='_mil_0.5', use_nr=False):
     if not split_suffix.startswith('_'):
         split_suffix = f'_{split_suffix}'
 
+    if use_nr and '_nr' not in split_suffix:
+        nr_candidates = [
+            f"{split_suffix}_nr0.95",
+            f"{split_suffix}_nr0.9",
+            f"{split_suffix}_nr"
+        ]
+        found = False
+        for cand in nr_candidates:
+            if os.path.exists(os.path.join(base_dir, f'data_prep/train{cand}.txt')) or os.path.exists(os.path.join(base_dir, f'train{cand}.txt')):
+                split_suffix = cand
+                found = True
+                break
+        if not found:
+            dp_dir = os.path.join(base_dir, 'data_prep')
+            if os.path.exists(dp_dir):
+                for f in os.listdir(dp_dir):
+                    if f.startswith(f'train{split_suffix}_nr') and f.endswith('.txt'):
+                        split_suffix = f.replace('train', '').replace('.txt', '')
+                        found = True
+                        break
+        if not found:
+            split_suffix = f"{split_suffix}_nr"
+
     train_path = os.path.join(base_dir, f'data_prep/train{split_suffix}.txt')
     val_path = os.path.join(base_dir, f'data_prep/validation{split_suffix}.txt')
     test_path = os.path.join(base_dir, f'data_prep/test{split_suffix}.txt')

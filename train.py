@@ -35,7 +35,7 @@ class EarlyStopping:
 
 def main():
     parser = argparse.ArgumentParser(description="Trénování modelů AMICO (LigandCrossAttentionMIL / SelfAttentionMIL)")
-    parser.add_argument('--model', type=str, default='ligand_cross_mil', choices=['ligand_cross_mil', 'self_attention_mil', 'self_att'], help='Architektura modelu (ligand_cross_mil nebo self_attention_mil)')
+    parser.add_argument('--model', type=str, default='ligand_cross_mil', choices=['ligand_cross_mil', 'self_attention_mil', 'self_att', 'sequence_mlp'], help='Architektura modelu (ligand_cross_mil, self_attention_mil nebo sequence_mlp)')
     parser.add_argument('--config-json', type=str, default=None, help='Cesta k JSON s nejlepšími parametry z Optuny')
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--lr', type=float, default=4.86e-5)
@@ -57,7 +57,30 @@ def main():
         args.model = 'self_attention_mil'
 
     if args.save_model is None:
-        args.save_model = 'self_attention_mil_best.pt' if args.model == 'self_attention_mil' else 'ligand_cross_mil_best.pt'
+        if args.model == 'self_attention_mil':
+            args.save_model = 'self_attention_mil_best.pt'
+        elif args.model == 'sequence_mlp':
+            args.save_model = 'sequence_mlp_best.pt'
+        else:
+            args.save_model = 'ligand_cross_mil_best.pt'
+
+    if args.model == 'sequence_mlp':
+        from benchmarks.sequence_mlp_benchmark import run_sequence_mlp
+        run_sequence_mlp(
+            split_suffix=args.split_suffix,
+            epochs=args.epochs,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            dropout=args.dropout,
+            label_smoothing=args.label_smoothing,
+            batch_size=args.batch_size,
+            hidden_dim=args.hidden_dim,
+            patience=args.patience,
+            pockets_path=args.pockets_path,
+            full_proteins_path=args.full_proteins_path,
+            save_model_path=args.save_model
+        )
+        return
 
     # Načtení Optuna konfigurace, pokud je zadána
     if args.config_json and os.path.exists(args.config_json):

@@ -266,11 +266,45 @@ class SelfAttentionMIL(nn.Module):
         return logits, attn_weights
 
 
+class SequenceMLPClassifier(nn.Module):
+    """
+    Pure sequence baseline model.
+    Classifies protein cofactor specificity directly from its global ESM-2 sequence embedding (1280-dim),
+    without candidate 3D pockets and without chemical ligand queries.
+    """
+    def __init__(self, in_features=1280, hidden_dim=256, num_classes=5, dropout=0.3):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_features, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, num_classes)
+        )
+        
+    def forward(self, x):
+        """
+        Args:
+            x: [B, 1280] or [B, N, 1280] full protein sequence embedding.
+        Returns:
+            logits: [B, 5]
+        """
+        if x.ndim == 3:
+            x = x.mean(dim=1)
+        return self.net(x)
+
+
 __all__ = [
     'COFACTORS',
     'TARGET_NAMES',
     'generate_ecfp4_fingerprints',
     'LigandCrossAttentionMIL',
     'SelfAttentionMIL',
+    'SequenceMLPClassifier',
 ]
+
 
