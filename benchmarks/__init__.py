@@ -9,9 +9,13 @@ Obsahuje baseline benchmarky pro predikci specificity kofaktorů:
 from benchmarks.foldseek_benchmark import run_foldseek_benchmark
 from benchmarks.sequence_mlp import SequenceMLPClassifier
 from benchmarks.sequence_mlp_benchmark import run_sequence_mlp
+from benchmarks.nise_benchmark import evaluate_amico_models, generate_nise_report
 
 __all__ = [
     'run_foldseek_benchmark',
     'SequenceMLPClassifier',
     'run_sequence_mlp',
+    'evaluate_amico_models',
+    'generate_nise_report',
 ]
+
