@@ -19,27 +19,24 @@ THREE_TO_ONE = {
     'THR': 'T', 'VAL': 'V', 'TRP': 'W', 'TYR': 'Y'
 }
 
+
 def is_aa(residue):
-    """Ověří, zda je reziduum standardní aminokyselina."""
+    """Checks whether a residue is a standard amino acid."""
     return residue.get_id()[0] == ' '
+
 
 def find_p2rank_executable(custom_path=None):
     """
-    Vyhledá spustitelný soubor P2Rank (prank).
-    Kontroluje zadanou cestu, systémovou proměnnou PATH a běžné relativní cesty.
+    Locates the P2Rank executable (prank).
+    Checks the provided path, PATH environment variable, and common project locations.
     """
     candidates = []
     if custom_path:
         candidates.append(Path(custom_path))
 
-    # Standardní lokace v projektu a PATH
+    # Standard locations within the project workspace and PATH
     candidates.extend([
         Path("p2rank_2.5.1/prank"),
-        Path("../p2rank_2.5.1/prank"),
-        Path("data_prep/p2rank_2.5.1/prank"),
-        Path("../data_prep/p2rank_2.5.1/prank"),
-        Path("p2rank/prank"),
-        Path("../p2rank/prank")
     ])
 
     for cand in candidates:
@@ -56,22 +53,23 @@ def find_p2rank_executable(custom_path=None):
 
     return custom_path if custom_path else "p2rank_2.5.1/prank"
 
+
 def run_p2rank(pdb_path, prank_exec=None, output_dir=None, config="alphafold"):
     """
-    Spustí P2Rank na zadaném PDB souboru a vrátí cestu ke složce s výstupy.
+    Runs P2Rank on a given PDB file and returns the path to the output directory.
     
     Args:
-        pdb_path: Cesta k PDB souboru.
-        prank_exec: Cesta k binárce prank (pokud None, zkusí automatickou detekci).
-        output_dir: Složka pro uložení výsledků (výchozí: ./temp_p2rank/<pdb_name>_prank_output).
-        config: Konfigurace P2Ranku (např. 'alphafold' nebo 'default').
+        pdb_path: Path to the target PDB file.
+        prank_exec: Path to prank binary (if None, attempts auto-detection).
+        output_dir: Directory to save prediction outputs (default: ./temp_p2rank/<stem>_prank_output).
+        config: P2Rank configuration profile ('alphafold' or 'default').
         
     Returns:
-        Path: Cesta ke složce s výstupy P2Ranku.
+        Path: Output directory path.
     """
     pdb_path = Path(pdb_path)
     if not pdb_path.exists():
-        raise FileNotFoundError(f"PDB soubor nebyl nalezen: {pdb_path}")
+        raise FileNotFoundError(f"PDB file not found: {pdb_path}")
 
     if output_dir is None:
         output_dir = Path("./temp_p2rank") / f"{pdb_path.stem}_prank_output"
@@ -82,7 +80,7 @@ def run_p2rank(pdb_path, prank_exec=None, output_dir=None, config="alphafold"):
 
     existing_preds = list(output_dir.glob("*_predictions.csv")) + list(output_dir.glob("*.csv"))
     if existing_preds:
-        print(f"-> Nalezeny existující výstupy P2Ranku v {output_dir} (přeskakuji opakovaný běh).")
+        print(f"-> Found existing P2Rank outputs in {output_dir} (skipping re-run).")
         return output_dir
 
     executable = find_p2rank_executable(prank_exec)
@@ -95,20 +93,21 @@ def run_p2rank(pdb_path, prank_exec=None, output_dir=None, config="alphafold"):
         "-visualizations", "0"
     ]
 
-    print(f"-> Spouštím P2Rank na {pdb_path.name}...")
+    print(f"-> Executing P2Rank on {pdb_path.name}...")
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
     except subprocess.CalledProcessError as e:
         raise RuntimeError(
-            f"Chyba při běhu P2Ranku:\nSTDOUT:\n{e.stdout}\nSTDERR:\n{e.stderr}"
+            f"Error during P2Rank execution:\nSTDOUT:\n{e.stdout}\nSTDERR:\n{e.stderr}"
         ) from e
     except FileNotFoundError:
         raise FileNotFoundError(
-            f"Spustitelný soubor P2Rank nebyl nalezen na '{executable}'. "
-            f"Zadejte prosím správnou cestu pomocí parametru --prank."
+            f"P2Rank executable not found at '{executable}'. "
+            f"Please specify the correct path using --prank."
         )
 
     return output_dir
+
 
 def run_p2rank_batch(
     pdb_paths,
@@ -119,24 +118,24 @@ def run_p2rank_batch(
     chunk_size=500
 ):
     """
-    Spustí P2Rank ve vysoce efektivním dávkovém režimu (-l dataset.ds) pro trénovací sadu.
+    Runs P2Rank in high-efficiency batch mode (-l dataset.ds) for training sets.
     
-    Výhody pro trénování (desítky tisíc struktur):
-    1. Spustí JVM a načte model náhodných lesů pouze JEDNOU (50-100x rychlejší než volání po jednom souboru).
-    2. Využívá multithreading P2Ranku přes zadaný počet jader CPU (-threads).
-    3. Automaticky přeskakuje již zpracované struktury (ochrana proti přerušení / resume).
-    4. Rozděluje seznam do chunků (např. po 500 souborech) s průběžným ukládáním.
+    Advantages for large dataset training:
+      1. Starts the JVM and loads random forest models only ONCE.
+      2. Uses multi-threading across specified CPU cores (-threads).
+      3. Automatically skips previously processed structures (resume support).
+      4. Splits structures into manageable chunks (e.g. 500 files).
     
     Args:
-        pdb_paths: Seznam cest (str nebo Path) k PDB souborům.
-        prank_exec: Cesta k binárce prank (pokud None, zkusí automatickou detekci).
-        output_dir: Složka pro uložení výsledků (výchozí: ./structures/p2rank_outputs).
-        config: Konfigurace P2Ranku ('alphafold' nebo 'default').
-        threads: Počet vláken pro P2Rank.
-        chunk_size: Velikost dávky (počet struktur na jeden běh P2Rank procesu).
+        pdb_paths: List of file paths to PDB structures.
+        prank_exec: Path to prank binary.
+        output_dir: Destination directory.
+        config: P2Rank configuration ('alphafold' or 'default').
+        threads: Number of CPU threads.
+        chunk_size: Batch chunk size.
         
     Returns:
-        Path: Cesta ke složce s výstupy.
+        Path: Output directory path.
     """
     if output_dir is None:
         output_dir = Path("./structures/p2rank_outputs")
@@ -146,7 +145,7 @@ def run_p2rank_batch(
     output_dir.mkdir(parents=True, exist_ok=True)
     executable = find_p2rank_executable(prank_exec)
 
-    # 1. Filtrování již zpracovaných PDB struktur (Resume podpora)
+    # 1. Filter out already processed structures for resume support
     to_process = []
     skipped_count = 0
     for p in pdb_paths:
@@ -169,16 +168,16 @@ def run_p2rank_batch(
         else:
             to_process.append(p.resolve())
 
-    print(f"-> P2Rank Dávkový režim: Celkem {len(pdb_paths)} struktur.")
+    print(f"P2Rank Batch Mode: Total {len(pdb_paths)} structures.")
     if skipped_count > 0:
-        print(f"   ⚡ Přeskočeno (již dříve predikováno): {skipped_count} struktur.")
-    print(f"   🚀 Zbývá predikovat: {len(to_process)} struktur (vláken: {threads}, chunk size: {chunk_size}).")
+        print(f"Skipped (already predicted): {skipped_count} structures.")
+    print(f"Remaining to process: {len(to_process)} structures (threads: {threads}, chunk size: {chunk_size}).")
 
     if not to_process:
-        print("-> Všechny struktury jsou již kompletně zpracovány.")
+        print("All structures have already been processed.")
         return output_dir
 
-    # 2. Zpracování v dávkách (chuncích)
+    # 2. Process in chunks
     total_chunks = (len(to_process) + chunk_size - 1) // chunk_size
     ds_temp_dir = output_dir / "temp_datasets"
     ds_temp_dir.mkdir(parents=True, exist_ok=True)
@@ -191,7 +190,7 @@ def run_p2rank_batch(
             for c_path in chunk_files:
                 f.write(f"{str(c_path)}\n")
 
-        print(f"\n[Dávka {chunk_idx + 1}/{total_chunks}] Spouštím P2Rank na {len(chunk_files)} strukturách...")
+        print(f"\n[Batch Chunk {chunk_idx + 1}/{total_chunks}] Running P2Rank on {len(chunk_files)} structures...")
         cmd = [
             executable, "predict",
             str(ds_file),
@@ -204,9 +203,9 @@ def run_p2rank_batch(
         try:
             subprocess.run(cmd, check=True)
         except subprocess.CalledProcessError as e:
-            print(f"❌ Chyba při běhu dávky #{chunk_idx + 1}: {e}")
+            print(f"Error during batch chunk #{chunk_idx + 1}: {e}")
         except FileNotFoundError:
-            raise FileNotFoundError(f"Spustitelný soubor P2Rank nebyl nalezen na '{executable}'.")
+            raise FileNotFoundError(f"P2Rank executable not found at '{executable}'.")
         finally:
             if ds_file.exists():
                 try:
@@ -220,12 +219,13 @@ def run_p2rank_batch(
         except OSError:
             pass
 
-    print(f"\n✅ Dávková predikce kapes v P2Rank dokončena. Výsledky uloženy v {output_dir}")
+    print(f"P2Rank batch pocket prediction completed. Results saved in {output_dir}")
     return output_dir
+
 
 def get_full_sequence_from_pdb(pdb_path):
     """
-    Extrahuje kompletní aminokyselinovou sekvenci a rezidua z PDB souboru.
+    Extracts full amino acid sequence and residue metadata from a PDB file.
     
     Returns:
         tuple: (seq_str, pdb_residues_dict, structure)
@@ -234,7 +234,7 @@ def get_full_sequence_from_pdb(pdb_path):
     structure = parser.get_structure('protein', str(pdb_path))
     
     sequence = []
-    pdb_residues = {} # (chain_id, resseq) -> residue
+    pdb_residues = {}
     residues_list = []
     
     for model in structure:
@@ -268,30 +268,30 @@ def get_full_sequence_from_pdb(pdb_path):
     seq_str = ''.join(sequence)
     return seq_str, pdb_residues, structure
 
+
 def parse_p2rank_output(prank_output_dir, pdb_path, min_prob=0.0):
     """
-    Načte výsledky P2Ranku (_predictions.csv a _residues.csv) pro daný protein.
-    Podporuje jak samostatné složky (single inference), tak sdílenou dávkovou složku (batch training).
+    Parses P2Rank prediction outputs (_predictions.csv and _residues.csv) for a protein.
+    Supports single prediction directories as well as shared batch folders.
     """
     prank_dir = Path(prank_output_dir)
     pdb_path = Path(pdb_path)
     
     full_seq, pdb_residues, structure = get_full_sequence_from_pdb(pdb_path)
     if not full_seq:
-        raise ValueError(f"Z {pdb_path} se nepodařilo extrahovat žádnou aminokyselinovou sekvenci.")
+        raise ValueError(f"Could not extract amino acid sequence from {pdb_path}.")
     
     all_residues = pdb_residues.get('_all_residues_list', [])
 
     stem = pdb_path.stem
     fname = pdb_path.name
 
-    # Možné složky pro hledání (sdílená složka i podsložka stem_prank_output)
     sub_dir = prank_dir / f"{stem}_prank_output"
     search_dirs = [prank_dir]
     if sub_dir.exists():
         search_dirs.insert(0, sub_dir)
 
-    # 1. Hledání _predictions.csv specifického pro daný protein
+    # 1. Search for _predictions.csv specific to target protein
     pred_csv = None
     pred_search_patterns = [
         f"{fname}_predictions.csv",
@@ -309,7 +309,6 @@ def parse_p2rank_output(prank_output_dir, pdb_path, min_prob=0.0):
         if pred_csv:
             break
 
-    # Fallback na glob pouze pokud jsme nenašli podle přesného jména
     if not pred_csv:
         pred_candidates = list(prank_dir.glob(f"{stem}*_predictions.csv")) + list(prank_dir.glob(f"{stem}*.csv"))
         if not pred_candidates:
@@ -317,7 +316,7 @@ def parse_p2rank_output(prank_output_dir, pdb_path, min_prob=0.0):
         if pred_candidates:
             pred_csv = pred_candidates[0]
 
-    # 2. Hledání _residues.csv specifického pro daný protein
+    # 2. Search for _residues.csv specific to target protein
     res_csv = None
     res_search_patterns = [
         f"{fname}_residues.csv",
@@ -354,11 +353,9 @@ def parse_p2rank_output(prank_output_dir, pdb_path, min_prob=0.0):
                 score = float(clean_row.get('score', 0.0))
                 rank = int(clean_row.get('rank', 1))
 
-                # Extrakce čísla kapsy
                 m = re.search(r'(\d+)', name)
                 pocket_id = int(m.group(1)) if m else rank
 
-                # Extrakce středu kapsy (center_x, center_y, center_z)
                 cx = float(clean_row.get('center_x', clean_row.get('x', 0.0)))
                 cy = float(clean_row.get('center_y', clean_row.get('y', 0.0)))
                 cz = float(clean_row.get('center_z', clean_row.get('z', 0.0)))
@@ -374,7 +371,7 @@ def parse_p2rank_output(prank_output_dir, pdb_path, min_prob=0.0):
                         'sequence': ''
                     }
 
-                    # Extrakce reziduí přímo ze sloupce 'residue_ids' v _predictions.csv
+                    # Extract residues from 'residue_ids' column if present
                     residue_ids_str = clean_row.get('residue_ids', '')
                     if residue_ids_str:
                         seen_res = set()
@@ -401,14 +398,13 @@ def parse_p2rank_output(prank_output_dir, pdb_path, min_prob=0.0):
 
                     pockets_dict[pocket_id] = pocket_entry
 
-    # 3. Načtení / doplnění reziduí z _residues.csv
+    # 3. Read/supplement residues from _residues.csv
     if res_csv and res_csv.exists():
         with open(res_csv, 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f, skipinitialspace=True)
             for row in reader:
                 clean_row = {k.strip(): v.strip() for k, v in row.items() if k is not None}
                 chain_id = clean_row.get('chain', clean_row.get('chain_id', '')).strip()
-                # P2Rank používá název sloupce 'residue_label'
                 resseq = clean_row.get('residue_label', clean_row.get('resseq', clean_row.get('residue_number', ''))).strip()
                 pname = clean_row.get('pocket', clean_row.get('pocket_name', '')).strip()
 
@@ -426,7 +422,7 @@ def parse_p2rank_output(prank_output_dir, pdb_path, min_prob=0.0):
                             if (r_info['chain_id'], r_info['resseq']) not in existing:
                                 pockets_dict[pid]['residues'].append(r_info)
 
-    # 4. Fallback: Pokud nebyly nalezeny kapsy v CSV, zkusíme hledat fyzické *_pocket_*.pdb soubory
+    # 4. Fallback: Check for physical *_pocket_*.pdb files if CSV parsing produced no pockets
     if not pockets_dict:
         pocket_pdbs = sorted(list(prank_dir.glob("*_pocket_*.pdb")))
         parser = PDBParser(QUIET=True)
@@ -452,17 +448,17 @@ def parse_p2rank_output(prank_output_dir, pdb_path, min_prob=0.0):
                 'sequence': ''.join(p_seq)
             }
 
-    # 5. Sestavení sekvencí pro jednotlivé kapsy
+    # 5. Build ordered sequences for each pocket
     pocket_list = []
     for pid in sorted(pockets_dict.keys()):
         p_data = pockets_dict[pid]
         
-        # Seřazení reziduí podle pořadí v primární sekvenci proteinu (N -> C terminus)
+        # Sort residues according to primary sequence order (N -> C terminus)
         if p_data['residues']:
             p_data['residues'].sort(key=lambda r: (r.get('chain_id', ''), r.get('seq_idx', 0)))
             p_data['sequence'] = ''.join([r['one_letter'] for r in p_data['residues']])
         
-        # Prostorový fallback: Pokud je sekvence stále prázdná, najdeme rezidua do 8.5 Å od středu
+        # Spatial fallback: If sequence is empty, query residues within 8.5 Å from center
         if not p_data['sequence'] and p_data.get('center') and p_data['center'] != [0.0, 0.0, 0.0] and all_residues:
             cx, cy, cz = p_data['center']
             center_arr = np.array([cx, cy, cz])
@@ -490,27 +486,28 @@ def parse_p2rank_output(prank_output_dir, pdb_path, min_prob=0.0):
         'pockets': pocket_list
     }
 
+
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="P2Rank Pocket Prediction CLI (Single & Batch pro trénovací data)")
-    parser.add_argument("--pdb", type=str, default=None, help="Cesta k jednomu PDB souboru")
-    parser.add_argument("--batch-dir", type=str, default=None, help="Cesta ke složce se všemi PDB strukturami (např. structures/all_pdbs)")
-    parser.add_argument("--metadata", type=str, default=None, help="Cesta k dataset_metadata.tsv pro výběr struktur")
-    parser.add_argument("--output-dir", type=str, default="structures/p2rank_outputs", help="Cesta pro uložení predikcí P2Ranku")
-    parser.add_argument("--config", type=str, default="alphafold", help="P2Rank konfigurace (alphafold / default)")
-    parser.add_argument("--threads", type=int, default=8, help="Počet vláken pro P2Rank")
-    parser.add_argument("--chunk-size", type=int, default=500, help="Velikost dávky pro dávkový režim")
-    parser.add_argument("--prank-exec", type=str, default=None, help="Vlastní cesta k binárce prank")
+    parser = argparse.ArgumentParser(description="P2Rank Pocket Prediction CLI (Single & Batch Mode)")
+    parser.add_argument("--pdb", type=str, default=None, help="Path to single PDB file")
+    parser.add_argument("--batch-dir", type=str, default=None, help="Path to folder containing PDB structures")
+    parser.add_argument("--metadata", type=str, default=None, help="Path to dataset_metadata.tsv for structure selection")
+    parser.add_argument("--output-dir", type=str, default="structures/p2rank_outputs", help="Directory to save P2Rank predictions")
+    parser.add_argument("--config", type=str, default="alphafold", help="P2Rank configuration (alphafold / default)")
+    parser.add_argument("--threads", type=int, default=8, help="Number of CPU threads for P2Rank")
+    parser.add_argument("--chunk-size", type=int, default=500, help="Batch chunk size")
+    parser.add_argument("--prank-exec", type=str, default=None, help="Custom path to prank executable binary")
     args = parser.parse_args()
 
     if args.pdb:
         out = run_p2rank(args.pdb, prank_exec=args.prank_exec, output_dir=args.output_dir, config=args.config)
         parsed = parse_p2rank_output(out, args.pdb)
-        print(f"\nVýsledek pro {args.pdb}:")
-        print(f"Sekvence: {len(parsed['full_sequence'])} aa")
-        print(f"Nalezeno kapes: {len(parsed['pockets'])}")
+        print(f"\nResult for {args.pdb}:")
+        print(f"Sequence length: {len(parsed['full_sequence'])} aa")
+        print(f"Pockets identified: {len(parsed['pockets'])}")
         for p in parsed['pockets'][:5]:
-            print(f" - Kapsa #{p['pocket_id']} ({p['name']}): Score={p['score']:.2f}, Rezidua={p['residue_count']}, Střed={p['center']}")
+            print(f" - Pocket #{p['pocket_id']} ({p['name']}): Score={p['score']:.2f}, Residues={p['residue_count']}, Center={p['center']}")
     elif args.batch_dir or args.metadata:
         pdb_files = []
         if args.metadata and os.path.exists(args.metadata):
@@ -528,7 +525,7 @@ if __name__ == "__main__":
             pdb_files = [f for f in Path(args.batch_dir).glob("*.pdb") if "_pocket_" not in f.name]
 
         if not pdb_files:
-            print("❌ Nenalezeny žádné PDB soubory k predikci.")
+            print("No PDB files found for prediction.")
         else:
             run_p2rank_batch(
                 pdb_files,

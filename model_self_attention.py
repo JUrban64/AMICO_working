@@ -6,13 +6,13 @@ TARGET_NAMES = ['acetyl-CoA', 'ATP', 'B12', 'FAD', 'NAD']
 
 class SelfAttentionMIL(nn.Module):
     """
-    Self-Attention Multi-Instance Learning Model.
+    Self-Attention Multi-Instance Learning (MIL) Model.
     
-    1. Global Context / CLS Token (Index 0): Embedding celého proteinu.
-    2. Instance Tokens (Indices 1..N): Kandidátní 3D kapsy z P2Ranku.
-    3. Multi-Head Self-Attention: Kontextuální interakce mezi proteinem a kapsami.
+    1. Global Context / CLS Token (Index 0): Whole-protein ESM-2 sequence embedding.
+    2. Instance Tokens (Indices 1..N): Candidate 3D binding pockets from P2Rank.
+    3. Multi-Head Self-Attention: Contextual interaction between protein and pockets.
     4. Transformer FFN + Residual LayerNorms.
-    5. Klasifikační hlava z aktualizovaného CLS tokenu.
+    5. Classification Head: Projects updated CLS token to cofactor logits.
     """
     def __init__(self, feature_dim=1280, hidden_dim=256, num_heads=4, num_classes=5, dropout=0.2):
         super().__init__()

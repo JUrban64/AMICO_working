@@ -7,7 +7,7 @@ from tqdm import tqdm
 import torch
 import numpy as np
 
-# Přidání kořenového adresáře AMICO do sys.path
+# Add project root directory to sys.path
 root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if root_dir not in sys.path:
     sys.path.insert(0, root_dir)
@@ -18,9 +18,10 @@ from esm_extractor import ESMFeatureExtractor
 TARGET_NAMES = ['acetyl-CoA', 'ATP', 'B12', 'FAD', 'NAD']
 NAME_TO_LABEL = {name: i for i, name in enumerate(TARGET_NAMES)}
 
+
 def load_metadata_targets(metadata_path):
     """
-    Načte dataset_metadata.tsv a vrátí mapování pdb_file -> metadata slovník.
+    Loads dataset_metadata.tsv and returns pdb_file -> metadata dictionary mapping.
     """
     targets = {}
     if not os.path.exists(metadata_path):
@@ -28,7 +29,7 @@ def load_metadata_targets(metadata_path):
 
     with open(metadata_path, 'r', encoding='utf-8') as f:
         reader = csv.reader(f, delimiter='\t')
-        next(reader, None) # přeskočit hlavičku
+        next(reader, None)  # skip header
         for row in reader:
             if not row or len(row) < 3:
                 continue
@@ -59,6 +60,7 @@ def load_metadata_targets(metadata_path):
                 }
     return targets
 
+
 def main():
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     default_pdb_dir = os.path.join(base_dir, 'structures', 'all_pdbs')
@@ -66,57 +68,57 @@ def main():
     default_metadata = os.path.join(base_dir, 'structures', 'dataset_metadata.tsv')
     default_out = os.path.join(base_dir, 'data_prep', 'esm_dataset.pt')
 
-    parser = argparse.ArgumentParser(description="Extrakce ESM-2 pocket embeddings ze samostatných P2Rank výstupů")
-    parser.add_argument('--prank-dir', type=str, default=default_prank_dir, help='Složka s existujícími výstupy P2Ranku (*_predictions.csv)')
-    parser.add_argument('--pdb-dir', type=str, default=default_pdb_dir, help='Složka se strukturami PDB (structures/all_pdbs)')
-    parser.add_argument('--metadata', type=str, default=default_metadata, help='Cesta k dataset_metadata.tsv')
-    parser.add_argument('--out-path', type=str, default=default_out, help='Výstupní soubor pro esm_dataset.pt')
-    parser.add_argument('--min-prob', type=float, default=0.30, help='Minimální pravděpodobnost kapsy z P2Ranku (default: 0.30)')
-    parser.add_argument('--esm-model', type=str, default='facebook/esm2_t33_650M_UR50D', help='Model ESM-2')
-    parser.add_argument('--device', type=str, default=None, help='Zařízení pro ESM (cuda, mps, cpu)')
-    parser.add_argument('--save-interval', type=int, default=100, help='Interval ukládání checkpointu')
-    parser.add_argument('--limit', type=int, default=None, help='Testovací limit na počet proteinů')
+    parser = argparse.ArgumentParser(description="Extract ESM-2 pocket embeddings from standalone P2Rank outputs")
+    parser.add_argument('--prank-dir', type=str, default=default_prank_dir, help='Directory containing P2Rank outputs (*_predictions.csv)')
+    parser.add_argument('--pdb-dir', type=str, default=default_pdb_dir, help='Folder containing PDB structures (structures/all_pdbs)')
+    parser.add_argument('--metadata', type=str, default=default_metadata, help='Path to dataset_metadata.tsv')
+    parser.add_argument('--out-path', type=str, default=default_out, help='Output file path for esm_dataset.pt')
+    parser.add_argument('--min-prob', type=float, default=0.30, help='Minimum P2Rank pocket probability threshold (default: 0.30)')
+    parser.add_argument('--esm-model', type=str, default='facebook/esm2_t33_650M_UR50D', help='HuggingFace ESM-2 model identifier')
+    parser.add_argument('--device', type=str, default=None, help='Compute device for ESM (cuda, mps, cpu)')
+    parser.add_argument('--save-interval', type=int, default=100, help='Checkpoint saving interval')
+    parser.add_argument('--limit', type=int, default=None, help='Limit number of processed proteins for testing')
     args = parser.parse_args()
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out_path)), exist_ok=True)
 
     print("=" * 65)
-    print("AMICO: GENERÁTOR POCKET EMBEDDINGS (Z HOTOVÉHO P2RANKU)")
+    print("AMICO: POCKET EMBEDDINGS GENERATOR (FROM P2RANK OUTPUTS)")
     print("=" * 65)
-    print(f"P2Rank výstupy:{args.prank_dir}")
-    print(f"PDB složka:    {args.pdb_dir}")
-    print(f"Metadata:      {args.metadata}")
-    print(f"Výstupní soubor:{args.out_path}")
-    print(f"Min. prob:     {args.min_prob}")
+    print(f"P2Rank outputs:  {args.prank_dir}")
+    print(f"PDB directory:   {args.pdb_dir}")
+    print(f"Metadata file:   {args.metadata}")
+    print(f"Output path:     {args.out_path}")
+    print(f"Min probability: {args.min_prob}")
     print("=" * 65)
 
-    # 1. Načtení metadat
+    # 1. Load metadata
     metadata_targets = load_metadata_targets(args.metadata)
-    print(f"-> Načteno {len(metadata_targets)} validních struktur z metadat.")
+    print(f"-> Loaded {len(metadata_targets)} valid target structures from metadata.")
 
-    # 2. Načtení existujícího souboru kapes (Resume)
+    # 2. Load existing pocket dataset for resume capability
     existing_pockets = []
     processed_pids = set()
     if os.path.exists(args.out_path):
-        print(f"-> Nalezen existující soubor kapes v {args.out_path}, načítám pro resume...")
+        print(f"-> Found existing pocket dataset in {args.out_path}, loading for resume...")
         existing_pockets = torch.load(args.out_path, weights_only=False)
         for item in existing_pockets:
             raw_pid = item['protein_id']
             base_name = os.path.basename(raw_pid)
             pid = base_name.split('_pocket_')[0].replace('.pdb', '').replace('_prank_output', '')
             processed_pids.add(pid)
-        print(f"-> Již zpracováno: {len(processed_pids)} unikátních proteinů v {args.out_path}.")
+        print(f"-> Already processed: {len(processed_pids)} unique proteins in {args.out_path}.")
 
-    # 3. Indexace PDB souborů na disku
+    # 3. Index PDB files on disk
     pdb_dir_path = Path(args.pdb_dir)
     if not pdb_dir_path.exists():
-        print(f"❌ Chyba: Složka s PDB strukturami {args.pdb_dir} neexistuje.")
+        print(f"❌ Error: PDB structure directory {args.pdb_dir} does not exist.")
         return
 
     all_pdb_files = [f for f in pdb_dir_path.glob("*.pdb") if "_pocket_" not in f.name]
     pdb_by_stem = {f.stem: f for f in all_pdb_files}
 
-    # Sestavení fronty ke zpracování
+    # Assemble queue to process
     queue = []
     if metadata_targets:
         for pdb_fname, meta in metadata_targets.items():
@@ -142,23 +144,23 @@ def main():
 
     if args.limit:
         queue = queue[:args.limit]
-        print(f"-> Testovací limit: Zpracovávám {len(queue)} struktur.")
+        print(f"-> Limit active: Processing {len(queue)} structures.")
     else:
-        print(f"-> Zbývá ke zpracování: {len(queue)} struktur.")
+        print(f"-> Remaining to process: {len(queue)} structures.")
 
     if not queue:
-        print("✅ Všechny kapsy jsou již kompletně extrahovány.")
+        print("✅ All pockets have already been extracted.")
         return
 
-    # 4. Inicializace ESM Feature Extractor
-    print(f"\n-> Inicializuji ESM Feature Extractor ({args.esm_model})...")
+    # 4. Initialize ESM Feature Extractor
+    print(f"\n-> Initializing ESM Feature Extractor ({args.esm_model})...")
     extractor = ESMFeatureExtractor(model_name=args.esm_model, device=args.device)
 
     new_pockets_list = list(existing_pockets)
     new_counter = 0
     missing_prank = 0
 
-    pbar = tqdm(queue, desc="ESM-2 Extrakce kapes")
+    pbar = tqdm(queue, desc="ESM-2 Pocket Extraction")
     for pdb_path, meta in pbar:
         stem = meta['stem']
         label = meta['label']
@@ -169,14 +171,13 @@ def main():
 
             pocket_seqs = [p['sequence'] for p in pockets if p.get('sequence')]
             if pocket_seqs:
-                # Extrakce embeddingů pro všechny detekované kapsy daného proteinu
-                pocket_embs = extractor.extract_pocket_embeddings(pocket_seqs) # [N, 1280]
+                pocket_embs = extractor.extract_pocket_embeddings(pocket_seqs)  # [N, 1280]
 
                 valid_idx = 0
                 for p_info in pockets:
                     if not p_info.get('sequence'):
                         continue
-                    p_feat = pocket_embs[valid_idx] # [1280]
+                    p_feat = pocket_embs[valid_idx]  # [1280]
                     valid_idx += 1
 
                     new_pockets_list.append({
@@ -194,19 +195,20 @@ def main():
             if new_counter % args.save_interval == 0:
                 torch.save(new_pockets_list, args.out_path)
 
-        except (FileNotFoundError, ValueError) as e:
+        except (FileNotFoundError, ValueError):
             missing_prank += 1
         except Exception as e:
-            print(f"\n❌ Chyba při extrakci kapes u {stem}: {e}")
+            print(f"\n❌ Error extracting pockets for {stem}: {e}")
 
-    # Finální uložení
+    # Final save
     torch.save(new_pockets_list, args.out_path)
     print("\n" + "=" * 65)
-    print("✅ HOTOVO!")
-    print(f"Celkem uloženo kapes do {args.out_path}: {len(new_pockets_list)}")
+    print("✅ COMPLETED!")
+    print(f"Total pockets saved to {args.out_path}: {len(new_pockets_list)}")
     if missing_prank > 0:
-        print(f"⚠️ Upozornění: Pro {missing_prank} proteinů nebyl nalezen výstup P2Ranku v {args.prank_dir}.")
+        print(f"⚠️ Warning: For {missing_prank} proteins, P2Rank outputs were not found in {args.prank_dir}.")
     print("=" * 65)
+
 
 if __name__ == "__main__":
     main()

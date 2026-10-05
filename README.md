@@ -1,118 +1,189 @@
-# AMICO (Final Model & Deployment)
-**Ligand-Protein Cross-Attention Multi-Instance Learning for Cofactor Specificity Prediction**
+# AMICO: Cofactor Specificity Prediction via Attention MIL
+
+AMICO predicts enzyme cofactor binding specificity (`ATP`, `NAD`, `FAD`, `B12`, `acetyl-CoA`) from protein 3D structures under strict cross-fold structural generalization.
 
 ---
 
-## 🌟 Overview
+## 🔄 End-to-End Pipeline
 
-AMICO predicts specific cofactor binding (`ATP`, `NAD`, `FAD`, `B12`, `acetyl-CoA`) for protein structures under strict **zero-shot cross-fold structural generalization**.
+```text
+[Raw PDB Structure] 
+        │
+        ├── 1. Pocket Detection (P2Rank) ──────────> 3D Binding Pockets (Residues + Coordinates)
+        │                                                          │
+        ├── 2. Representation Learning (ESM-2)                     │
+        │      ├─ Whole-protein sequence ──────────> Global Context Vector [1280]
+        │      └─ Pocket residue segments ─────────> Multi-Instance Pocket Bag [N, 1280]
+        │                                                          │
+        ├── 3. AMICO Model (LigandCrossAttentionMIL / SelfAttentionMIL)
+        │      ├─ ECFP4 Chemical Fingerprints [5, 1024] cross-attend over [N+1, D]
+        │      ├─ Multi-Head Attention identifies pocket relevance weights
+        │      └─ Monte Carlo Dropout (T=30) -> Probabilities + Epistemic Uncertainty
+        │                                                          │
+        └── 4. Downstream Docking (AutoDock Vina, Optional)
+               └─ Docks 3D cofactor conformer into top P2Rank pocket center
+```
 
-This repository contains the standalone, production-ready implementation of the winning **`LigandCrossAttentionMIL`** model.
-
-### 🧬 Core Architectural Features:
-1. **End-to-End P2Rank Pocket Detection & Extraction:** Directly accepts `.pdb` structures, detects 3D pockets, and extracts pocket residue sequences + 3D coordinates.
-2. **ESM-2 Multi-Instance & Global Context:** Computes per-pocket embeddings ($[N_{\text{pockets}}, 1280]$) alongside a global whole-protein context anchor on token index 0 ($[1280]$).
-3. **Morgan ECFP4 Chemical Fingerprints:** 1024-bit cofactor fingerprints act as queries cross-attending over both protein context and candidate pockets.
-4. **Bayesian Monte Carlo Dropout:** $T=30$ stochastic passes quantify epistemic uncertainty (std dev) and detect True Negatives (non-binders or out-of-distribution enzymes).
-5. **Direct Pocket Localization & Docking:** Cross-attention weights highlight the exact functional pocket and automatically guide **AutoDock Vina** docking into the pocket center.
+### Pipeline Stages:
+1. **Data Curation & Diversity Sampling (`data_prep/alphafoldDB_APi.py`)**:
+   Downloads AlphaFold structures across cofactors using UniProt cursor pagination with taxonomic (`taxonId`) and functional (`EC`) throttling to eliminate redundancy.
+2. **Homology-Free Structural Splitting (`data_prep/structure_clustering.py`)**:
+   Clusters structures with Foldseek to construct cross-fold train/validation/test splits, preventing data leakage across structural superfamilies.
+3. **Feature Preprocessing (`data_prep/build_esm_dataset.py`)**:
+   Executes P2Rank pocket discovery and ESM-2 (`esm2_t33_650M_UR50D`) extraction in batch to produce `esm_dataset.pt` (pocket bags) and `esm_full_proteins.pt` (global sequence context).
+4. **Attention MIL Classification (`model_ligand_cross_att.py`, `model_self_attention.py`)**:
+   - `LigandCrossAttentionMIL`: Morgan ECFP4 cofactor fingerprints act as queries cross-attending over structural pocket representations and global context.
+   - `SelfAttentionMIL`: Self-attention pooling across pocket instances without chemical queries.
+5. **Inference & AutoDock Vina Docking (`predict.py`, `docking_utils.py`)**:
+   Accepts a raw PDB, runs end-to-end pocket detection + ESM-2 embedding + AMICO inference, quantifies uncertainty, and optionally docks the predicted ligand into the pocket center.
 
 ---
 
 ## 📁 Repository Structure
 
 ```text
-AMICOfin/
-├── PROJECT_KNOWLEDGE_SUMMARY.md     # Full scientific documentation & findings
-├── README.md                        # Usage guide & documentation
-├── requirements.txt                 # Dependencies (torch, transformers, rdkit, etc.)
+AMICO/
+├── README.md                            # Documentation
+├── requirements.txt                     # Dependencies
 │
-├── model.py                         # ⭐ LigandCrossAttentionMIL neural architecture
-├── dataset.py                       # Pockets + Full Protein data loader & collator
-├── train.py                         # Full training script with Optuna JSON config support
-├── predict.py                       # Production End-to-End inference CLI & API
-├── p2rank_utils.py                  # P2Rank runner & pocket CSV parser
-├── esm_extractor.py                 # ESM-2 feature extractor (GPU/MPS/CPU)
-├── docking_utils.py                 # AutoDock Vina molecular docking pipeline
-├── tune_optuna.py                   # Automated Bayesian hyperparameter search (SQLite)
+├── model_ligand_cross_att.py            # LigandCrossAttentionMIL architecture
+├── model_self_attention.py              # SelfAttentionMIL architecture
+│
+├── dataset.py                           # Dataset loader & collator for MIL bags
+├── train_ligand_cross_att.py            # Trainer for LigandCrossAttentionMIL
+├── train_self_attention.py              # Trainer for SelfAttentionMIL
+│
+├── predict.py                           # End-to-end inference CLI & API
+├── p2rank_utils.py                      # P2Rank execution & output parsing
+├── esm_extractor.py                     # ESM-2 feature extractor
+├── docking_utils.py                     # AutoDock Vina preparation & docking
+├── tune_optuna.py                       # Hyperparameter optimization (Optuna)
 │
 └── data_prep/
-    ├── alphafoldDB_APi.py                # Paralelní stahování struktur z AlphaFold DB & tvorba dataset_metadata.tsv
-    ├── two_level_structure_clustering.py # Dvouúrovňové Foldseek shlukování & StratifiedGroupKFold splitting
-    ├── structure_clustering.py           # Jednoúrovňové strukturní shlukování
-    ├── build_esm_dataset.py              # All-in-one: P2Rank dávka + ESM-2 embeddingy do esm_dataset.pt & esm_full_proteins.pt
-    ├── generate_pocket_embeddings.py     # Generátor esm_dataset.pt z již hotových P2Rank výstupů
-    └── generate_full_protein_embeddings.py # Generátor ESM-2 celoproteinových embeddingů do esm_full_proteins.pt
+    ├── alphafoldDB_APi.py               # AlphaFold DB downloading & metadata curation
+    ├── structure_clustering.py          # Foldseek clustering & cluster-split generation
+    ├── build_esm_dataset.py             # Batch P2Rank + ESM-2 extraction pipeline
+    ├── generate_pocket_embeddings.py    # Pocket-only embedding builder
+    └── generate_full_protein_embeddings.py # Full-protein embedding builder
 ```
 
 ---
 
-## 🚀 Quickstart Guide
+## ⚙️ Installation
 
-### 1. End-to-End Prediction from a PDB File (P2Rank + ESM-2 + AMICO)
 ```bash
-# Spuštění kompletní pipeline na novém PDB souboru (s MC Dropoutem):
+git clone https://github.com/JUrban64/AMICO.git
+cd AMICO
+pip install -r requirements.txt
+```
+
+*Requirements:* Python ≥ 3.10, PyTorch ≥ 2.0, [P2Rank](https://github.com/rdkit/p2rank) (optional for inference from raw PDBs), and AutoDock Vina (optional for docking).
+
+---
+
+## 🚀 Usage
+
+### 1. End-to-End Inference from a PDB Structure
+```bash
+# Predict cofactor specificity and estimate MC Dropout uncertainty:
 python predict.py \
-    --pdb /path/to/my_protein.pdb \
+    --pdb /path/to/protein.pdb \
     --checkpoint ligand_cross_mil_best.pt \
     --mc-samples 30
 
-# End-to-End predikce + automatické dokování do lokalizované kapsy:
+# Predict and automatically dock the predicted cofactor into the top pocket:
 python predict.py \
-    --pdb /path/to/my_protein.pdb \
+    --pdb /path/to/protein.pdb \
     --checkpoint ligand_cross_mil_best.pt \
-    --mc-samples 30 \
     --dock \
-    --dock-out ./my_docking_results
+    --dock-out ./docking_results
 ```
 
-### 2. Trénování Modelu
+### 2. Model Training
 ```bash
-# Standardní trénování na zadaném splitu:
-python train.py --split-suffix mil_0.5 --epochs 50
+# Train Ligand Cross-Attention MIL:
+python train_ligand_cross_att.py --split-suffix mil_0.5 --epochs 50
 
-# Trénování s nejlepšími parametry z Optuna tuningu:
-python train.py --config-json best_params_ligand_cross_mil_0.5.json --epochs 50
+# Train with Optuna-tuned hyperparameters:
+python train_ligand_cross_att.py --config-json best_params_ligand_cross_mil_0.5.json --epochs 50
+
+# Train Self-Attention MIL:
+python train_self_attention.py --split-suffix mil_0.5 --epochs 50
 ```
 
-### 3. Hyperparameter Optimization (Optuna)
+### 3. Hyperparameter Tuning
 ```bash
-python tune_optuna.py --split-suffix mil_0.5 --n-trials 50
+python tune_optuna.py --model ligand_cross_mil --split-suffix mil_0.5 --n-trials 50
+```
+
+### 4. Data Preparation Pipeline
+
+#### A. Download AlphaFold Structures (`alphafoldDB_APi.py`)
+Downloads cofactor-binding structures from AlphaFold DB with taxonomic and functional diversity controls. Configured via parameters at the top of `data_prep/alphafoldDB_APi.py`:
+- `TARGET_PER_CLASS`: Target quotas per cofactor (e.g. `{'ATP': 17000, 'NAD': 14000, 'FAD': 10000, 'acetyl-CoA': 6500, 'B12': 2500}`).
+- `MAX_PER_EC`: Max enzymes per primary EC number (default: `40`).
+- `MAX_PER_ORG_EC`: Max enzymes per organism-EC combination (default: `1`).
+- `MIN_LENGTH` / `MAX_LENGTH`: Sequence length bounds (default: `60` – `1400` aa).
+- `NUM_WORKERS`: Parallel download threads (default: `16`).
+
+```bash
+# Run structure download and metadata generation (resumes automatically):
+python data_prep/alphafoldDB_APi.py
+```
+
+#### B. Structural Clustering & Zero-Leakage Splits (`structure_clustering.py`)
+Clusters structures with **Foldseek** (`easy-cluster`) and performs stratified group splitting to guarantee that no structural folds or superfamilies leak across splits.
+
+**Clustering Options:**
+- `--tmscore-threshold`, `--tmscore` *(float, default: `0.5`)*: TM-score threshold for Foldseek easy-cluster (e.g. `0.5` enforces distinct structural fold separation).
+- `--nr-threshold` *(float, optional)*: Non-redundant pre-filtering threshold (e.g. `--nr-threshold 0.9` discards structures with TM-score ≥ 0.9 prior to clustering).
+- `--metadata` *(str, optional)*: Path to `dataset_metadata.tsv` or `master_dataset_cache.json` for class-stratified splitting.
+- `--test`: Quick dry-run on 30 structures.
+
+```bash
+# Standard fold-level clustering (TM-score 0.5):
+python data_prep/structure_clustering.py --tmscore-threshold 0.5
+
+# Two-level clustering (90% non-redundancy pre-filter + TM-score 0.5 clustering):
+python data_prep/structure_clustering.py --tmscore-threshold 0.5 --nr-threshold 0.9
+
+# Outputs generated:
+#   train_mil_0.5.txt, validation_mil_0.5.txt, test_mil_0.5.txt, clusters_mil_0.5.json
+```
+
+#### C. Pocket Detection & ESM-2 Extraction (`build_esm_dataset.py`)
+Processes PDB structures through P2Rank and ESM-2 in batch to produce training datasets (`esm_dataset.pt` and `esm_full_proteins.pt`).
+
+**Extraction Options:**
+- `--pdb-dir` *(str)*: Directory containing `.pdb` files (default: `structures/all_pdbs`).
+- `--metadata` *(str)*: Path to `dataset_metadata.tsv`.
+- `--min-prob` *(float, default: `0.30`)*: Minimum P2Rank pocket probability threshold.
+- `--threads` *(int, default: `8`)*: CPU threads for P2Rank execution.
+- `--skip-p2rank`: Skip running P2Rank and reuse existing pocket CSV files.
+- `--pockets-only` / `--full-only`: Generate only `esm_dataset.pt` or `esm_full_proteins.pt`.
+
+```bash
+# Full extraction pipeline (P2Rank + ESM-2):
+python data_prep/build_esm_dataset.py --threads 8 --min-prob 0.30
+
+# Reuse existing P2Rank pocket predictions:
+python data_prep/build_esm_dataset.py --skip-p2rank
 ```
 
 ---
 
 ## 💻 Python API Example
 
-### A. End-to-End z PDB souboru
 ```python
 from predict import AMICOPredictor
 
 predictor = AMICOPredictor(checkpoint_path="ligand_cross_mil_best.pt")
 
-# Automaticky spustí P2Rank, ESM-2 a LigandCrossAttentionMIL
-result = predictor.predict_from_pdb(
-    pdb_path="alphafold_structure.pdb",
-    mc_samples=30
-)
+# End-to-end: PDB -> P2Rank -> ESM-2 -> AMICO -> Prediction
+result = predictor.predict_from_pdb("protein.pdb", mc_samples=30)
 
-print(f"Predicted Cofactor:  {result['predicted_cofactor']}")
-print(f"Confidence:          {result['confidence'] * 100:.2f} %")
-print(f"Uncertainty (std):   ±{result['uncertainty_std'] * 100:.2f} %")
-print(f"Best Binding Pocket: Pocket #{result['best_binding_pocket']}")
-print(f"3D Pocket Center:    {result['best_pocket_center']}")
-```
-
-### B. Přímá inference z embeddingů
-```python
-from predict import AMICOPredictor
-import torch
-
-predictor = AMICOPredictor(checkpoint_path="ligand_cross_mil_best.pt")
-
-# pocket_features [N_pockets, 1280], full_protein [1280]
-dummy_pockets = torch.randn(3, 1280)
-dummy_full_prot = torch.randn(1280)
-
-result = predictor.predict(dummy_pockets, dummy_full_prot, mc_samples=30)
-print(f"Predicted: {result['predicted_cofactor']}, Status: {result['binding_status']}")
+print(f"Predicted Cofactor: {result['predicted_cofactor']}")
+print(f"Confidence:         {result['confidence'] * 100:.1f} %")
+print(f"Uncertainty (std):  ±{result['uncertainty_std'] * 100:.2f} %")
+print(f"Pocket Center:      {result['best_pocket_center']}")
 ```

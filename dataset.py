@@ -8,7 +8,7 @@ from collections import defaultdict
 TARGET_NAMES = ['acetyl-CoA', 'ATP', 'B12', 'FAD', 'NAD']
 
 def load_split_ids(base_dir, split_suffix='_mil_0.5', use_nr=False):
-    """Načte ID proteinů pro train/val/test podle zadaného split suffixu."""
+    """Loads protein identifiers for train/val/test splits based on the specified split suffix."""
     if not split_suffix.startswith('_'):
         split_suffix = f'_{split_suffix}'
 
@@ -54,7 +54,7 @@ def load_split_ids(base_dir, split_suffix='_mil_0.5', use_nr=False):
 
 
 def match_id(pid, id_set):
-    """Zkontroluje shodu ID proteinu (včetně ošetření přípon typu _MERGED, fragmentů _F1 a .pdb)."""
+    """Checks whether a protein ID matches any entry in id_set, handling suffixes like _MERGED, fragments _F1, and .pdb."""
     clean_p = pid.replace('.pdb', '')
     if clean_p in id_set:
         return True
@@ -64,12 +64,12 @@ def match_id(pid, id_set):
 
 def load_cross_mil_data(pockets_path, full_proteins_path, mode='pockets'):
     """
-    Načte ESM pocket embeddingy a ESM full protein embeddingy a spáruje je.
+    Loads ESM pocket embeddings and ESM whole-protein embeddings, pairing them into MIL bags.
     """
-    print(f"Načítám pocket features z {pockets_path}...")
+    print(f"Loading pocket features from {pockets_path}...")
     raw_pockets = torch.load(pockets_path, weights_only=False)
     
-    print(f"Načítám full protein features z {full_proteins_path}...")
+    print(f"Loading full protein features from {full_proteins_path}...")
     full_proteins = torch.load(full_proteins_path, weights_only=False)
     
     bags_dict = defaultdict(list)
@@ -81,7 +81,7 @@ def load_cross_mil_data(pockets_path, full_proteins_path, mode='pockets'):
         base_name = os.path.basename(raw_pid)
         pid = base_name.split('_pocket_')[0].replace('.pdb', '').replace('_prank_output', '')
         
-        # Ověření přítomnosti full protein embeddingu (včetně podpory fragmentů _F1)
+        # Verify presence of full protein embedding (supporting fragments like _F1)
         if pid not in full_proteins:
             clean_pid = pid.split('_')[0]
             if clean_pid in full_proteins:
@@ -90,7 +90,7 @@ def load_cross_mil_data(pockets_path, full_proteins_path, mode='pockets'):
                 missing_full_prot += 1
                 continue
             
-        feat = item['features'] # [num_residues, 1280] nebo [1280]
+        feat = item['features']  # [num_residues, 1280] or [1280]
         label = item['label']
         labels_dict[pid] = label
         
@@ -102,7 +102,7 @@ def load_cross_mil_data(pockets_path, full_proteins_path, mode='pockets'):
             bags_dict[pid].append(feat.cpu().numpy() if torch.is_tensor(feat) else np.array(feat))
             
     if missing_full_prot > 0:
-        print(f"Upozornění: U {missing_full_prot} kapes chyběl full protein embedding.")
+        print(f"Warning: Missing full protein embedding for {missing_full_prot} pockets.")
         
     bag_list = []
     for pid in bags_dict:
@@ -124,7 +124,7 @@ def load_cross_mil_data(pockets_path, full_proteins_path, mode='pockets'):
             'label': torch.LongTensor([labels_dict[pid]])
         })
         
-    print(f"Úspěšně načteno {len(bag_list)} spárovaných proteinů.")
+    print(f"Successfully loaded {len(bag_list)} paired protein bags.")
     return bag_list
 
 
@@ -141,20 +141,20 @@ class CrossMilDataset(Dataset):
 
 def custom_collate_fn(batch):
     """
-    Zarovná kapsy (padding) a vytvoří padding masku.
+    Pads pocket sequences to uniform batch length and constructs the attention padding mask.
     """
     pocket_features_list = [item['pocket_features'] for item in batch]
     full_protein_list = [item['full_protein_feature'] for item in batch]
     labels_list = [item['label'] for item in batch]
     
-    padded_pockets = pad_sequence(pocket_features_list, batch_first=True, padding_value=0.0) # [B, max_N, 1280]
+    padded_pockets = pad_sequence(pocket_features_list, batch_first=True, padding_value=0.0)  # [B, max_N, 1280]
     lengths = torch.tensor([pf.size(0) for pf in pocket_features_list])
     max_len = padded_pockets.size(1)
     
-    padding_mask = torch.arange(max_len).expand(len(lengths), max_len) >= lengths.unsqueeze(1) # [B, max_N]
+    padding_mask = torch.arange(max_len).expand(len(lengths), max_len) >= lengths.unsqueeze(1)  # [B, max_N]
     
-    full_proteins = torch.stack(full_protein_list, dim=0) # [B, 1280]
-    labels = torch.cat(labels_list, dim=0)                # [B]
+    full_proteins = torch.stack(full_protein_list, dim=0)  # [B, 1280]
+    labels = torch.cat(labels_list, dim=0)                 # [B]
     
     return padded_pockets, padding_mask, full_proteins, labels
 
@@ -173,5 +173,5 @@ def get_cross_mil_splits(pockets_path, full_proteins_path, base_dir, split_suffi
         elif match_id(pid, test_ids):
             test_bags.append(b)
             
-    print(f"Rozdělení ({split_suffix}) -> Train: {len(train_bags)}, Val: {len(val_bags)}, Test: {len(test_bags)}")
+    print(f"Splits ({split_suffix}) -> Train: {len(train_bags)}, Val: {len(val_bags)}, Test: {len(test_bags)}")
     return train_bags, val_bags, test_bags

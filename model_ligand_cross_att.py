@@ -4,7 +4,7 @@ from rdkit import Chem
 from rdkit.Chem import AllChem
 import numpy as np
 
-# Kanonické cílové kofaktory a jejich SMILES
+# Canonical target cofactors and their SMILES
 COFACTORS = {
     'acetyl-CoA': r'CC(C)(COP(=O)(O)OP(=O)(O)OC[C@H]1O[C@H]([C@H](O)[C@@H]1OP(=O)(O)O)n2cnc3c(N)ncnc23)[C@@H](O)C(=O)NCCC(=O)NCCSC(=O)C',
     'ATP': r'Nc1ncnc2n(cnc12)[C@@H]1O[C@H](COP(=O)(O)OP(=O)(O)OP(=O)(O)O)[C@@H](O)[C@H]1O',
@@ -16,8 +16,8 @@ COFACTORS = {
 TARGET_NAMES = ['acetyl-CoA', 'ATP', 'B12', 'FAD', 'NAD']
 
 
-def generate_ecfp4_fingerprints(radius=2, n_bits=1024):
-    """Generuje 1024-bitové Morgan ECFP4 fingerprinty pro všech 5 kofaktorů."""
+def generate_ecfp4_fingerprints(radius=2, n_bits=2048):
+    """Generates 1024-bit Morgan ECFP4 fingerprints for all 5 target cofactors."""
     fps = []
     try:
         from rdkit.Chem import rdFingerprintGenerator
@@ -45,18 +45,18 @@ class LigandCrossAttentionMIL(nn.Module):
     """
     Ligand-Protein Cross-Attention Multi-Instance Learning Model.
     
-    1. Keys & Values: Globální proteinový kontext (token 0) + P2Rank 3D kapsy (tokeny 1..N).
-    2. Queries: 5 ECFP4 chemických fingerprintů kofaktorů.
-    3. Multi-Head Cross-Attention: Chemicky naváděná pozornost mezi ligandy a kapsami.
+    1. Keys & Values: Global protein context (token 0) + P2Rank 3D pockets (tokens 1..N).
+    2. Queries: 5 ECFP4 chemical cofactor fingerprints.
+    3. Multi-Head Cross-Attention: Chemically guided attention between ligands and pockets.
     4. Transformer FFN + Residual LayerNorms.
-    5. Lineární Scorer pro 5 tříd kofaktorů.
+    5. Linear Scorer: Output logits for each cofactor class.
     """
     def __init__(self, feature_dim=1280, ecfp_dim=1024, hidden_dim=256, num_heads=4, num_classes=5, dropout=0.2):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_classes = num_classes
         
-        # Projekce do sdíleného prostoru
+        # Shared latent space projections
         self.pocket_proj = nn.Sequential(
             nn.Linear(feature_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -79,7 +79,7 @@ class LigandCrossAttentionMIL(nn.Module):
             nn.Linear(hidden_dim, hidden_dim)
         )
         
-        # ECFP4 fingerprinty kofaktorů
+        # ECFP4 cofactor fingerprints
         cofactor_fps = generate_ecfp4_fingerprints(n_bits=ecfp_dim)
         self.register_buffer('cofactor_fps', cofactor_fps)
         
@@ -91,7 +91,7 @@ class LigandCrossAttentionMIL(nn.Module):
             batch_first=True
         )
         
-        # FFN blok
+        # FFN block
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.norm2 = nn.LayerNorm(hidden_dim)
         self.ffn = nn.Sequential(
@@ -112,11 +112,11 @@ class LigandCrossAttentionMIL(nn.Module):
     def forward(self, pocket_features, padding_mask, full_protein_feature=None):
         B, N, _ = pocket_features.size()
         
-        # Keys & Values z kapes
+        # Keys & Values from pockets
         k = self.pocket_proj(pocket_features)
         v = k
         
-        # Připojení celého proteinu jako token 0
+        # Prepend whole protein embedding as token 0
         if full_protein_feature is not None:
             prot_tok = self.protein_proj(full_protein_feature).unsqueeze(1)
             k = torch.cat([prot_tok, k], dim=1)
@@ -126,7 +126,7 @@ class LigandCrossAttentionMIL(nn.Module):
         else:
             mask = padding_mask
             
-        # Queries z kofaktorů
+        # Queries from cofactors
         q_ligands = self.ligand_proj(self.cofactor_fps).unsqueeze(0).expand(B, -1, -1)
         
         # Cross-Attention

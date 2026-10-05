@@ -5,14 +5,17 @@ from pathlib import Path
 import torch
 import numpy as np
 
-from model import LigandCrossAttentionMIL, SelfAttentionMIL, TARGET_NAMES
+from model_ligand_cross_att import LigandCrossAttentionMIL, TARGET_NAMES
+from model_self_attention import SelfAttentionMIL
 from p2rank_utils import run_p2rank, parse_p2rank_output, find_p2rank_executable
+
 
 class AMICOPredictor:
     """
-    Inferenční třída pro modely AMICO (LigandCrossAttentionMIL / SelfAttentionMIL).
-    Umožňuje predikovat kofaktor, lokalizovat vazebnou kapsu, odhadovat epistemickou nejistotu 
-    pomocí MC Dropoutu a provádět end-to-end inferenci přímo z PDB souboru (P2Rank + ESM-2).
+    Inference predictor class for AMICO models (LigandCrossAttentionMIL / SelfAttentionMIL).
+    Supports cofactor specificity prediction, binding pocket localization, epistemic
+    uncertainty estimation via Monte Carlo Dropout, and end-to-end inference directly
+    from raw PDB structures (P2Rank + ESM-2).
     """
     def __init__(self, checkpoint_path=None, config_json=None, model_type='auto', device=None):
         if device is None:
@@ -33,7 +36,7 @@ class AMICOPredictor:
                 if model_type == 'auto' and 'model' in cfg:
                     model_type = cfg['model']
 
-        # Načtení vah a případná automatická detekce architektury
+        # Load weights and auto-detect architecture if requested
         loaded_state = None
         if checkpoint_path and os.path.exists(checkpoint_path):
             state = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
@@ -42,18 +45,18 @@ class AMICOPredictor:
                     state = state['model_state_dict']
                 elif 'state_dict' in state:
                     state = state['state_dict']
-                # Odstranění případného 'module.' prefixu z DistributedDataParallel
+                # Strip potential 'module.' prefix from DistributedDataParallel
                 state = {k[7:] if k.startswith('module.') else k: v for k, v in state.items()}
             loaded_state = state
 
-            # Auto detekce architektury podle vah v checkpointu
+            # Auto-detect architecture from checkpoint weight keys
             if model_type == 'auto':
                 if 'self_attn.in_proj_weight' in loaded_state:
                     model_type = 'self_attention_mil'
                 elif 'cross_attn.in_proj_weight' in loaded_state:
                     model_type = 'ligand_cross_mil'
 
-        # Inicializace zvolené architektury
+        # Initialize chosen architecture
         if model_type in ['self_attention_mil', 'self_att']:
             self.model_type = 'self_attention_mil'
             self.model = SelfAttentionMIL(
@@ -76,22 +79,22 @@ class AMICOPredictor:
 
         if loaded_state is not None:
             self.model.load_state_dict(loaded_state)
-            print(f"Checkpoint načten z {checkpoint_path} (Architektura: {self.model.__class__.__name__})")
+            print(f"Checkpoint successfully loaded from {checkpoint_path} (Architecture: {self.model.__class__.__name__})")
         else:
-            print(f"Upozornění: Checkpoint '{checkpoint_path}' nenalezen. Model {self.model.__class__.__name__} inicializován bez načtení vah.")
+            print(f"Warning: Checkpoint '{checkpoint_path}' not found. Initialized {self.model.__class__.__name__} with random weights.")
 
         self.model.eval()
         self._esm_extractor = None
 
     def _get_esm_extractor(self, model_name="facebook/esm2_t33_650M_UR50D"):
-        """Líná inicializace ESM-2 extraktoru příznaků."""
+        """Lazy initialization of ESM-2 feature extractor."""
         if self._esm_extractor is None:
             from esm_extractor import ESMFeatureExtractor
             self._esm_extractor = ESMFeatureExtractor(model_name=model_name, device=self.device)
         return self._esm_extractor
 
     def _enable_mc_dropout(self):
-        """Ponechá model v eval módu, ale aktivuje Dropout vrstvy pro MC vzorkování."""
+        """Keep model in eval mode but activate Dropout layers for Monte Carlo sampling."""
         self.model.eval()
         for m in self.model.modules():
             if isinstance(m, torch.nn.Dropout):
@@ -100,17 +103,17 @@ class AMICOPredictor:
     def predict(self, pocket_features, full_protein_feature, mc_samples=30, 
                 confidence_threshold=0.50, uncertainty_threshold=0.15):
         """
-        Provede inferenci s volitelným Monte Carlo Dropout vzorkováním.
+        Runs model inference with optional Monte Carlo Dropout uncertainty estimation.
         
         Args:
-            pocket_features: Tensor [N_pockets, 1280] nebo np.ndarray
-            full_protein_feature: Tensor [1280] nebo np.ndarray
-            mc_samples: Počet stochastických průchodů (1 = standardní deterministický režim, >=20 pro MC Dropout)
-            confidence_threshold: Minimální průměrná pravděpodobnost pro potvrzení vazby kofaktoru
-            uncertainty_threshold: Maximální povolená směrodatná odchylka (rozptyl) pro jistou predikci
+            pocket_features: Tensor [N_pockets, 1280] or np.ndarray
+            full_protein_feature: Tensor [1280] or np.ndarray
+            mc_samples: Number of stochastic forward passes (1 = deterministic, >=20 for MC Dropout)
+            confidence_threshold: Minimum mean probability required to confirm cofactor binding
+            uncertainty_threshold: Maximum allowed standard deviation (variance) for confident prediction
 
         Returns:
-            dict s kompletními výsledky predikce, nejistoty a detekce True Negatives
+            dict containing prediction results, epistemic uncertainty, and non-binder detection
         """
         if isinstance(pocket_features, np.ndarray):
             pocket_features = torch.FloatTensor(pocket_features)
@@ -120,10 +123,10 @@ class AMICOPredictor:
         if pocket_features.dim() == 1 and pocket_features.numel() == 0:
             pocket_features = pocket_features.view(0, 1280)
         elif pocket_features.dim() == 2:
-            pocket_features = pocket_features.unsqueeze(0) # [1, N, 1280]
+            pocket_features = pocket_features.unsqueeze(0)  # [1, N, 1280]
         
         if full_protein_feature.dim() == 1:
-            full_protein_feature = full_protein_feature.unsqueeze(0) # [1, 1280]
+            full_protein_feature = full_protein_feature.unsqueeze(0)  # [1, 1280]
 
         pocket_features = pocket_features.to(self.device)
         full_protein_feature = full_protein_feature.to(self.device)
@@ -132,7 +135,7 @@ class AMICOPredictor:
         padding_mask = torch.zeros(1, num_pockets, dtype=torch.bool, device=self.device)
 
         if mc_samples > 1:
-            # === MONTE CARLO DROPOUT REŽIM ===
+            # === MONTE CARLO DROPOUT MODE ===
             self._enable_mc_dropout()
             all_probs = []
             all_attns = []
@@ -145,14 +148,14 @@ class AMICOPredictor:
                     all_probs.append(probs)
                     all_attns.append(attn)
 
-            all_probs = np.stack(all_probs, axis=0) # [T, 5]
-            all_attns = np.stack(all_attns, axis=0) # [T, 5, N+1]
+            all_probs = np.stack(all_probs, axis=0)  # [T, 5]
+            all_attns = np.stack(all_attns, axis=0)  # [T, 5, N+1] or [T, N+1, N+1]
 
-            mean_probs = np.mean(all_probs, axis=0) # [5]
-            std_probs = np.std(all_probs, axis=0)   # [5] (Epistemická nejistota)
-            mean_attn = np.mean(all_attns, axis=0)  # [5, N+1]
+            mean_probs = np.mean(all_probs, axis=0)  # [5]
+            std_probs = np.std(all_probs, axis=0)    # [5] (Epistemic uncertainty)
+            mean_attn = np.mean(all_attns, axis=0)   # [5, N+1] or [N+1, N+1]
             
-            # Prediktivní entropie: H = - sum(p * log(p))
+            # Predictive entropy: H = - sum(p * log(p))
             predictive_entropy = -float(np.sum(mean_probs * np.log(mean_probs + 1e-12)))
 
             pred_idx = int(np.argmax(mean_probs))
@@ -160,7 +163,7 @@ class AMICOPredictor:
             confidence = float(mean_probs[pred_idx])
             uncertainty = float(std_probs[pred_idx])
             
-            # Detekce True Negatives (Nevazačů / Out-of-Distribution proteinů)
+            # Non-binder / Out-of-Distribution protein detection
             is_non_binder = (confidence < confidence_threshold) or (uncertainty > uncertainty_threshold)
             binding_status = "NON_BINDER / UNKNOWN_COFACTOR" if is_non_binder else "BINDER"
 
@@ -174,7 +177,7 @@ class AMICOPredictor:
             used_attn = mean_attn
 
         else:
-            # === DETERMINISTICKÝ REŽIM ===
+            # === DETERMINISTIC MODE ===
             self.model.eval()
             with torch.no_grad():
                 logits, attn_weights = self.model(pocket_features, padding_mask, full_protein_feature)
@@ -196,14 +199,14 @@ class AMICOPredictor:
                 for i in range(len(TARGET_NAMES))
             }
 
-        # Interpretace vazebných kapes
+        # Interpret binding pocket attention
         if used_attn.ndim == 2 and used_attn.shape[0] == len(TARGET_NAMES):
-            # LigandCrossAttentionMIL: [5, N+1] -> váha pozornosti pro předpovězený kofaktor
+            # LigandCrossAttentionMIL: [5, N+1] -> attention distribution for predicted cofactor
             cofactor_attn = used_attn[pred_idx]
             global_context_weight = float(cofactor_attn[0])
             pocket_attn_weights = cofactor_attn[1:]
         elif used_attn.ndim == 2:
-            # SelfAttentionMIL: [N+1, N+1] -> pozornost CLS proteinového tokenu (index 0) k sobě a kapsám
+            # SelfAttentionMIL: [N+1, N+1] -> attention from CLS global protein token (index 0)
             cls_attn = used_attn[0]
             global_context_weight = float(cls_attn[0])
             pocket_attn_weights = cls_attn[1:]
@@ -243,37 +246,37 @@ class AMICOPredictor:
                          esm_model="facebook/esm2_t33_650M_UR50D", mc_samples=30,
                          confidence_threshold=0.50, uncertainty_threshold=0.15):
         """
-        End-to-End predikce z PDB struktury:
-        1. Spuštění P2Ranku (nebo načtení existující složky)
-        2. Extrakce sekvencí a 3D souřadnic kapes
-        3. Výpočet ESM-2 embeddingů (kapsy + globální kontext proteinu)
-        4. LigandCrossAttentionMIL inference s MC Dropoutem
-        5. Mapování pozornosti na fyzické souřadnice kapes pro dokování
+        End-to-End prediction from a PDB structure:
+          1. Execute P2Rank pocket prediction (or reuse cached output)
+          2. Parse pocket amino acid sequences and 3D coordinates
+          3. Compute ESM-2 embeddings (pockets + whole-protein global context)
+          4. Run AMICO inference with Monte Carlo Dropout
+          5. Map attention weights to physical 3D pocket coordinates for docking
         """
         pdb_path = Path(pdb_path)
         if not pdb_path.exists():
-            raise FileNotFoundError(f"PDB soubor nebyl nalezen: {pdb_path}")
+            raise FileNotFoundError(f"PDB file not found: {pdb_path}")
 
         # 1. P2Rank
         if prank_out_dir and Path(prank_out_dir).exists():
             out_dir = Path(prank_out_dir)
-            print(f"-> Používám existující výstupy P2Ranku z {out_dir}")
+            print(f"-> Reusing existing P2Rank outputs from {out_dir}")
         else:
             out_dir = run_p2rank(pdb_path, prank_exec=prank_exec)
 
-        # 2. Parsování kapes
-        print(f"-> Analyzuji nalezené kapsy z {out_dir}...")
+        # 2. Parse pockets
+        print(f"-> Parsing predicted pockets from {out_dir}...")
         parsed_data = parse_p2rank_output(out_dir, pdb_path, min_prob=min_prob)
         pockets = parsed_data['pockets']
-        print(f"-> Nalezeno {len(pockets)} vhodných kapes (min_prob >= {min_prob}).")
+        print(f"-> Found {len(pockets)} candidate pockets (min_prob >= {min_prob}).")
 
-        # 3. ESM-2 extrakce
+        # 3. ESM-2 extraction
         extractor = self._get_esm_extractor(model_name=esm_model)
-        print("-> Generuji ESM-2 embeddingy...")
+        print("-> Generating ESM-2 embeddings...")
         pocket_features, full_protein_feature = extractor.extract_all_from_parsed(parsed_data)
 
-        # 4. AMICO Model Inference
-        print("-> Spouštím model LigandCrossAttentionMIL...")
+        # 4. AMICO model inference
+        print(f"-> Running {self.model_type} inference...")
         res = self.predict(
             pocket_features=pocket_features,
             full_protein_feature=full_protein_feature,
@@ -282,7 +285,7 @@ class AMICOPredictor:
             uncertainty_threshold=uncertainty_threshold
         )
 
-        # 5. Obohacení výsledků o metadata z P2Ranku
+        # 5. Enrich results with P2Rank metadata
         pocket_map = {p['pocket_id']: p for p in pockets}
         enriched_rankings = []
         for r in res['pocket_rankings']:
@@ -301,6 +304,21 @@ class AMICOPredictor:
 
         res['pocket_rankings'] = enriched_rankings
         res['p2rank_output_dir'] = str(out_dir)
+
+        # Identify top P2Rank pocket (rank 1 by score / probability) for docking
+        if pockets:
+            best_p2rank_pocket = max(pockets, key=lambda p: (p.get('score', 0.0), p.get('probability', 0.0)))
+            res['best_p2rank_pocket_id'] = best_p2rank_pocket['pocket_id']
+            res['best_p2rank_pocket_name'] = best_p2rank_pocket['name']
+            res['best_p2rank_pocket_center'] = best_p2rank_pocket['center']
+            res['best_p2rank_score'] = best_p2rank_pocket.get('score', 0.0)
+            res['best_p2rank_prob'] = best_p2rank_pocket.get('probability', 0.0)
+        else:
+            res['best_p2rank_pocket_id'] = None
+            res['best_p2rank_pocket_name'] = None
+            res['best_p2rank_pocket_center'] = [0.0, 0.0, 0.0]
+            res['best_p2rank_score'] = 0.0
+            res['best_p2rank_prob'] = 0.0
 
         best_pid = res['best_binding_pocket']
         raw_pid = res.get('raw_best_pocket', best_pid)
@@ -323,27 +341,33 @@ class AMICOPredictor:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="AMICO: End-to-End P2Rank + ESM-2 + Ligand Cross-Attention Inference & Dokování")
-    parser.add_argument('--pdb', type=str, default=None, help='Cesta k PDB souboru proteinu pro end-to-end predikci')
-    parser.add_argument('--prank', type=str, default=None, help='Cesta ke spustitelnému souboru P2Rank (výchozí: hledá v projektu/PATH)')
-    parser.add_argument('--p2rank-dir', type=str, default=None, help='Cesta k již hotové složce s výstupy P2Ranku (přeskočí běh P2Ranku)')
-    parser.add_argument('--min-prob', type=float, default=0.0, help='Minimální pravděpodobnost kapsy z P2Ranku (0.0 = všechny)')
-    parser.add_argument('--esm-model', type=str, default='facebook/esm2_t33_650M_UR50D', help='Model ESM-2 z HuggingFace')
+    parser = argparse.ArgumentParser(description="AMICO: End-to-End P2Rank + ESM-2 + Attention MIL Inference & Docking")
+    parser.add_argument('--pdb', type=str, default=None, help='Path to target protein PDB structure file')
+    parser.add_argument('--prank', type=str, default=None, help='Path to P2Rank prank binary (default: auto-detected)')
+    parser.add_argument('--p2rank-dir', type=str, default=None, help='Path to existing P2Rank output directory')
+    parser.add_argument('--min-prob', type=float, default=0.0, help='Minimum P2Rank pocket probability threshold (0.0 = all)')
+    parser.add_argument('--esm-model', type=str, default='facebook/esm2_t33_650M_UR50D', help='HuggingFace ESM-2 model identifier')
 
-    parser.add_argument('--model-type', type=str, default='auto', choices=['auto', 'ligand_cross_mil', 'self_attention_mil', 'self_att'], help='Typ architektury modelu (auto, ligand_cross_mil nebo self_attention_mil)')
-    parser.add_argument('--checkpoint', type=str, default=None, help='Cesta k vahám modelu (výchozí: podle typu modelu)')
-    parser.add_argument('--config', type=str, default=None, help='Cesta ke konfiguraci JSON (z Optuna tuningu)')
-    parser.add_argument('--mc-samples', type=int, default=30, help='Počet MC Dropout vzorků (1 = deterministický, 30 = MC Dropout)')
-    parser.add_argument('--confidence-thresh', type=float, default=0.50, help='Minimální jistota pro klasifikaci jako vazač')
-    parser.add_argument('--uncertainty-thresh', type=float, default=0.15, help='Maximální rozptyl pro klasifikaci jako vazač')
+    parser.add_argument(
+        '--model-type',
+        type=str,
+        default='auto',
+        choices=['auto', 'ligand_cross_mil', 'self_attention_mil', 'self_att'],
+        help='Model architecture type (auto, ligand_cross_mil, or self_attention_mil)'
+    )
+    parser.add_argument('--checkpoint', type=str, default=None, help='Path to model weights checkpoint')
+    parser.add_argument('--config', type=str, default=None, help='Path to Optuna configuration JSON')
+    parser.add_argument('--mc-samples', type=int, default=30, help='Number of MC Dropout stochastic samples (1 = deterministic, 30 = MC Dropout)')
+    parser.add_argument('--confidence-thresh', type=float, default=0.50, help='Minimum confidence threshold for binder classification')
+    parser.add_argument('--uncertainty-thresh', type=float, default=0.15, help='Maximum allowed uncertainty std dev for binder classification')
 
-    parser.add_argument('--dock', action='store_true', help='Automaticky nadokovat předpovězený kofaktor do identifikované kapsy')
-    parser.add_argument('--force-dock', action='store_true', help='Vynutit dokování i při nízké jistotě / označení za nevazače')
-    parser.add_argument('--pocket-center', nargs=3, type=float, default=None, help='Manuální souřadnice středu kapsy x y z (volitelné)')
-    parser.add_argument('--dock-out', type=str, default='docking_results', help='Složka pro uložení výsledků dokování')
+    parser.add_argument('--dock', action='store_true', help='Automatically dock predicted cofactor into identified binding pocket')
+    parser.add_argument('--force-dock', action='store_true', help='Force molecular docking even if classified as non-binder')
+    parser.add_argument('--pocket-center', nargs=3, type=float, default=None, help='Manual pocket center coordinates x y z (optional)')
+    parser.add_argument('--dock-out', type=str, default='docking_results', help='Directory for docking output files')
     args = parser.parse_args()
 
-    # Výchozí checkpoint podle modelu, pokud nebyl zadán
+    # Default checkpoint path selection
     if args.checkpoint is None:
         if args.model_type in ['self_attention_mil', 'self_att']:
             args.checkpoint = 'self_attention_mil_best.pt'
@@ -357,19 +381,18 @@ def main():
     predictor = AMICOPredictor(checkpoint_path=args.checkpoint, config_json=args.config, model_type=args.model_type)
 
     if args.pdb or args.p2rank_dir:
-        # === END-TO-END REŽIM Z PDB NEBO P2RANK VÝSTUPŮ ===
+        # === END-TO-END MODE FROM PDB OR P2RANK OUTPUTS ===
         pdb_file = args.pdb
         if not pdb_file and args.p2rank_dir:
-            # Zkusíme najít PDB soubor v okolí p2rank_dir
             pdb_candidates = list(Path(args.p2rank_dir).parent.glob("*.pdb"))
             if pdb_candidates:
                 pdb_file = str(pdb_candidates[0])
             else:
-                raise ValueError("Byl zadán --p2rank-dir, ale nebyl zadán odpovídající --pdb soubor.")
+                raise ValueError("Specified --p2rank-dir without a corresponding --pdb file.")
 
-        print(f"\n=======================================================")
-        print(f"  Spouštím End-to-End Pipeline: {Path(pdb_file).name}")
-        print(f"=======================================================")
+        print("\n" + "=" * 65)
+        print(f"  Starting End-to-End Prediction Pipeline: {Path(pdb_file).name}")
+        print("=" * 65)
 
         res = predictor.predict_from_pdb(
             pdb_path=pdb_file,
@@ -383,8 +406,8 @@ def main():
         )
         prot_id = Path(pdb_file).stem
     else:
-        # === DEMO / MOCK REŽIM (Bez PDB souboru) ===
-        print("\n[INFO] Nebyl zadán parametr --pdb. Spouštím ukázkovou predikci na mock datech...")
+        # === DEMO MODE (Synthetic input) ===
+        print("\n[INFO] No --pdb provided. Running demo inference with synthetic tensors...")
         dummy_pockets = torch.randn(3, 1280)
         dummy_full_prot = torch.randn(1280)
 
@@ -397,28 +420,29 @@ def main():
         )
         prot_id = "sample_protein_demo"
 
-    # Výpis výsledků
-    print("\n" + "="*65)
-    print(f"            VÝSLEDEK INFERENCE: {prot_id}")
-    print("="*65)
-    print(f"Status vazby:            {res['binding_status']}")
-    print(f"Předpovězený kofaktor:   {res['predicted_cofactor']}")
-    print(f"Průměrná jistota (mean): {res['confidence']*100:.2f} %")
+    # Display results
+    print("\n" + "=" * 65)
+    print(f"            AMICO INFERENCE RESULTS: {prot_id}")
+    print("=" * 65)
+    print(f"Binding Status:          {res['binding_status']}")
+    print(f"Predicted Cofactor:      {res['predicted_cofactor']}")
+    print(f"Mean Confidence:         {res['confidence'] * 100:.2f} %")
     if args.mc_samples > 1:
-        print(f"Nejistota (MC std dev):  ±{res['uncertainty_std']*100:.2f} % (vzorků: {res['mc_samples_used']})")
-        print(f"Prediktivní entropie:    {res['predictive_entropy']:.4f}")
+        print(f"Uncertainty (MC std):    ±{res['uncertainty_std'] * 100:.2f} % (Samples: {res['mc_samples_used']})")
+        print(f"Predictive Entropy:      {res['predictive_entropy']:.4f}")
     
     if res['is_confident_prediction']:
-        print(f"\nLokalizace vazebného místa:")
-        print(f" -> Nejlepší kapsa:      Pocket #{res['best_binding_pocket']} (Attention: {res['best_pocket_attention']:.4f})")
-        if 'best_pocket_center' in res:
-            cx, cy, cz = res['best_pocket_center']
-            print(f" -> 3D Střed kapsy:      [x={cx:.2f}, y={cy:.2f}, z={cz:.2f}]")
-        print(f" -> Vliv celého enzymu:  {res['global_context_weight']:.4f}")
+        print(f"\nBinding Pocket Localization:")
+        if res.get('best_p2rank_pocket_id') is not None:
+            cx, cy, cz = res['best_p2rank_pocket_center']
+            print(f" -> Top P2Rank Pocket (Docking Site): Pocket #{res['best_p2rank_pocket_id']} ({res['best_p2rank_pocket_name']}) | Score: {res['best_p2rank_score']:.2f}, Prob: {res['best_p2rank_prob']:.2f}")
+            print(f"    3D Coordinates:                  [x={cx:.2f}, y={cy:.2f}, z={cz:.2f}]")
+        print(f" -> Model Attention Focus:           Pocket #{res['best_binding_pocket']} (Attention: {res['best_pocket_attention']:.4f})")
+        print(f" -> Global Enzyme Influence:         {res['global_context_weight']:.4f}")
     else:
-        print("\n⚠️ Model vyhodnotil protein jako NE-VAZAČ (True Negative) nebo je predikce příliš nejistá.")
+        print("\n⚠️ Model classified protein as NON-BINDER (True Negative) or prediction is below confidence threshold.")
 
-    print("\nPravděpodobnosti jednotlivých kofaktorů:")
+    print("\nCofactor Probabilities:")
     for name, p_data in res['probabilities'].items():
         if args.mc_samples > 1:
             mean_p = p_data['mean_probability'] * 100
@@ -428,42 +452,49 @@ def main():
             p = p_data['probability'] * 100
             print(f" - {name:<12}: {p:6.2f} %")
 
-    print("\nPořadí kapes podle chemické kompatibility:")
+    print("\nPocket Compatibility Rankings:")
     for p_info in res['pocket_rankings']:
-        p_str = f" - Kapsa #{p_info['pocket_id']:<2}: Attention = {p_info['attention_score']:.4f}"
+        p_str = f" - Pocket #{p_info['pocket_id']:<2}: Attention = {p_info['attention_score']:.4f}"
         if 'p2rank_prob' in p_info:
-            p_str += f" | P2Rank Prob: {p_info['p2rank_prob']:.2f} | Reziduí: {p_info['residue_count']}"
+            p_str += f" | P2Rank Prob: {p_info['p2rank_prob']:.2f} | Residues: {p_info['residue_count']}"
         print(p_str)
 
-    # Dokování předpovězeného kofaktoru, pokud je vyžádáno
+    # Molecular docking if requested (into best P2Rank pocket)
     if args.dock or args.force_dock:
         if not res['is_confident_prediction'] and not args.force_dock:
-            print("\n[DOCKING SKIP] Dokování přeskočeno: protein byl vyhodnocen jako nevazač (pro vynucení použijte --force-dock nebo upravte prahy).")
+            print("\n[DOCKING SKIPPED] Docking skipped: protein evaluated as non-binder (use --force-dock to override).")
         else:
             from docking_utils import dock_predicted_cofactor
 
             pred_cofactor = res['raw_top_class']
             pdb_path = args.pdb if args.pdb else "sample_protein.pdb"
             
+            # Prioritize top P2Rank pocket for molecular docking
             center = None
+            docking_site_label = ""
             if args.pocket_center:
                 center = np.array(args.pocket_center)
+                docking_site_label = f"manual coordinates [{center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f}]"
+            elif 'best_p2rank_pocket_center' in res and res['best_p2rank_pocket_center'] and sum(abs(x) for x in res['best_p2rank_pocket_center']) > 1e-4:
+                center = np.array(res['best_p2rank_pocket_center'])
+                docking_site_label = f"top P2Rank Pocket #{res.get('best_p2rank_pocket_id', 1)} ({res.get('best_p2rank_pocket_name', 'pocket1')}, score={res.get('best_p2rank_score', 0.0):.2f})"
             elif 'best_pocket_center' in res and res['best_pocket_center'] and sum(abs(x) for x in res['best_pocket_center']) > 1e-4:
                 center = np.array(res['best_pocket_center'])
-            elif 'raw_best_pocket_center' in res and res['raw_best_pocket_center'] and sum(abs(x) for x in res['raw_best_pocket_center']) > 1e-4:
-                center = np.array(res['raw_best_pocket_center'])
+                docking_site_label = f"attention focus Pocket #{res.get('best_binding_pocket', 1)}"
             else:
                 from docking_utils import get_pocket_center_from_pdb
                 center = get_pocket_center_from_pdb(pdb_path) if os.path.exists(pdb_path) else np.array([0.0, 0.0, 0.0])
+                docking_site_label = "protein center of mass fallback"
 
-            print(f"\n-> Spouštím molekulární dokování ({pred_cofactor}) do středu [{center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f}]...")
+            print(f"\n-> Launching molecular docking for {pred_cofactor} into {docking_site_label} at center [{center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f}] Å...")
             dock_res = dock_predicted_cofactor(
                 protein_pdb=pdb_path,
                 cofactor_name=pred_cofactor,
                 pocket_center=center,
+                p2rank_dir=res.get('p2rank_output_dir'),
                 out_dir=args.dock_out
             )
-            print(f"✨ Dokování dokončeno. Výstupní soubory uloženy do: {dock_res['output_dir']}/")
+            print(f"✨ Docking completed. Output files stored in: {dock_res['output_dir']}/")
 
 
 if __name__ == '__main__':

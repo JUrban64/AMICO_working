@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Trénovací skript pro model AMICO Ligand Cross-Attention MIL (model_ligand_cross_att).
-==================================================================================
+Training script for AMICO Ligand Cross-Attention MIL (model_ligand_cross_att).
+=============================================================================
 """
 
 import os
@@ -68,7 +68,7 @@ def train_ligand_cross_att(
     config_json=None
 ):
     if config_json and os.path.exists(config_json):
-        print(f"Načítám konfiguraci z {config_json}...")
+        print(f"Loading configuration from {config_json}...")
         with open(config_json, 'r') as f:
             cfg = json.load(f)
         hidden_dim = cfg.get('hidden_dim', hidden_dim)
@@ -82,8 +82,8 @@ def train_ligand_cross_att(
             split_suffix = cfg['split_suffix']
 
     device = torch.device('cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'))
-    print(f"Používám zařízení: {device}")
-    print(f"Hyperparametry LigandCrossAttentionMIL: lr={lr:.2e}, weight_decay={weight_decay:.2e}, dropout={dropout}, label_smoothing={label_smoothing}, hidden_dim={hidden_dim}, heads={num_heads}, batch_size={batch_size}")
+    print(f"Using compute device: {device}")
+    print(f"LigandCrossAttentionMIL Hyperparameters: lr={lr:.2e}, weight_decay={weight_decay:.2e}, dropout={dropout}, label_smoothing={label_smoothing}, hidden_dim={hidden_dim}, heads={num_heads}, batch_size={batch_size}")
 
     base_dir = PROJECT_ROOT
     pockets_full = os.path.join(base_dir, pockets_path) if not os.path.isabs(pockets_path) else pockets_path
@@ -102,9 +102,9 @@ def train_ligand_cross_att(
         elif match_id(pid, test_ids):
             test_bags.append(b)
 
-    print(f"Rozdělení ({split_suffix}) -> Train: {len(train_bags)}, Val: {len(val_bags)}, Test: {len(test_bags)}")
+    print(f"Split breakdown ({split_suffix}) -> Train: {len(train_bags)}, Val: {len(val_bags)}, Test: {len(test_bags)}")
     if len(train_bags) == 0:
-        print("Chyba: prázdný train set!")
+        print("Error: empty train set!")
         return None
 
     train_loader = DataLoader(train_bags, batch_size=batch_size, shuffle=True, collate_fn=custom_collate_fn)
@@ -118,7 +118,7 @@ def train_ligand_cross_att(
     criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
     model = LigandCrossAttentionMIL(
         feature_dim=1280,
-        ecfp_dim=1024,
+        ecfp_dim=2048,
         hidden_dim=hidden_dim,
         num_heads=num_heads,
         num_classes=5,
@@ -147,7 +147,7 @@ def train_ligand_cross_att(
         rep = classification_report(truths, preds, target_names=TARGET_NAMES, output_dict=True, zero_division=0) if classification_report and len(truths) > 0 else {}
         return loss_sum / max(len(truths), 1), acc, f1_m, rep
 
-    print(f"\n--- Spouštím trénování LigandCrossAttentionMIL | Ukládání do: {save_model} ---")
+    print(f"\n--- Starting LigandCrossAttentionMIL Training | Saving checkpoint to: {save_model} ---")
     best_val_loss = float('inf')
     best_weights = None
 
@@ -172,7 +172,7 @@ def train_ligand_cross_att(
             best_val_loss = val_loss
             best_weights = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             torch.save(best_weights, save_model)
-            save_msg = "🔥 (Model uložen)"
+            save_msg = "🔥 (Model saved)"
         else:
             save_msg = ""
 
@@ -181,21 +181,21 @@ def train_ligand_cross_att(
 
         early_stopping(val_loss)
         if early_stopping.early_stop:
-            print(f"Early stopping aktivován po {epoch} epochách.")
+            print(f"Early stopping triggered after {epoch} epochs.")
             break
 
     if best_weights:
         model.load_state_dict({k: v.to(device) for k, v in best_weights.items()})
 
     print("\n" + "=" * 50)
-    print("      VÝSLEDKY EVALUACE (Best Checkpoint)     ")
+    print("      EVALUATION RESULTS (Best Checkpoint)     ")
     print("=" * 50)
     _, val_acc, val_f1, _ = evaluate(val_loader)
-    print(f"VALIDACE -> Acc: {val_acc:.4f} | Macro F1: {val_f1:.4f}")
+    print(f"VALIDATION -> Acc: {val_acc:.4f} | Macro F1: {val_f1:.4f}")
 
     if test_loader:
         _, test_acc, test_f1, test_rep = evaluate(test_loader)
-        print(f"TEST     -> Acc: {test_acc:.4f} | Macro F1: {test_f1:.4f}")
+        print(f"TEST       -> Acc: {test_acc:.4f} | Macro F1: {test_f1:.4f}")
         for name in TARGET_NAMES:
             if name in test_rep:
                 print(f" - {name:<12}: Precision={test_rep[name]['precision']:.4f}, Recall={test_rep[name]['recall']:.4f}, F1={test_rep[name]['f1-score']:.4f}")
@@ -204,8 +204,8 @@ def train_ligand_cross_att(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Trénování modelu AMICO LigandCrossAttentionMIL (model_ligand_cross_att)")
-    parser.add_argument('--config-json', type=str, default=None, help='Cesta k JSON s nejlepšími parametry z Optuny')
+    parser = argparse.ArgumentParser(description="Train AMICO LigandCrossAttentionMIL model (model_ligand_cross_att)")
+    parser.add_argument('--config-json', type=str, default=None, help='Path to Optuna best parameters JSON')
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--lr', type=float, default=4.86e-5)
     parser.add_argument('--weight-decay', type=float, default=1.07e-5)
@@ -218,7 +218,7 @@ def main():
     parser.add_argument('--split-suffix', type=str, default='mil_0.5')
     parser.add_argument('--pockets-path', default='data_prep/esm_dataset.pt')
     parser.add_argument('--full-proteins-path', default='data_prep/esm_full_proteins.pt')
-    parser.add_argument('--save-model', type=str, default='ligand_cross_mil_best.pt', help='Cesta pro uložení modelu')
+    parser.add_argument('--save-model', type=str, default='ligand_cross_mil_best.pt', help='Output checkpoint file path')
     args = parser.parse_args()
 
     train_ligand_cross_att(

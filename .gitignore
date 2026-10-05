@@ -5,6 +5,8 @@ __pycache__/
 *.so
 .Python
 env/
+venv/
+ENV/
 build/
 develop-eggs/
 dist/
@@ -20,15 +22,12 @@ var/
 .installed.cfg
 *.egg
 
-# Virtual environments
-venv/
-ENV/
-
-# IDEs
+# IDEs and OS
 .idea/
 .vscode/
 *.swp
 *.swo
+.DS_Store
 
 # Data and models
 *.pt
@@ -38,16 +37,21 @@ ENV/
 *.json
 *.csv
 *.tsv
-data_prep/temp_prank_out/
-temp_inference/
+*.log
 temp/
+temp_*/
+data_prep/temp_prank_out/
 p2rank_2.5.1/
 *_prank_output/
-structures/all_pdbs/
-structures/p2rank_outputs/
-structures/*.log
-structures/*.tsv
-structures/*.json
+structures/
 data_prep/*.txt
-# macOS
-.DS_Store
+
+# Internal / Documentation / Benchmarks (Ignored as requested)
+PROJECT_KNOWLEDGE_SUMMARY.md
+*project_knowledge*
+*PROJECT_KNOWLEDGE*
+benchmarks/
+benchmakrs
+benchmakrs/
+nise_benchmark.py
+nise_*

@@ -2,17 +2,26 @@ import os
 import argparse
 import json
 from datetime import datetime
-import optuna
-from optuna.pruners import MedianPruner
+try:
+    import optuna
+    from optuna.pruners import MedianPruner
+except ImportError:
+    optuna = None
+    MedianPruner = None
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from sklearn.metrics import f1_score
+try:
+    from sklearn.metrics import f1_score
+except ImportError:
+    f1_score = None
 
 from dataset import load_cross_mil_data, load_split_ids, match_id, custom_collate_fn
-from model import LigandCrossAttentionMIL, SelfAttentionMIL
+from model_ligand_cross_att import LigandCrossAttentionMIL
+from model_self_attention import SelfAttentionMIL
+
 
 def objective(trial, all_bags, train_ids, val_ids, device, epochs=35, model_type='ligand_cross_mil'):
     hidden_dim = trial.suggest_categorical('hidden_dim', [128, 256, 512])
@@ -75,7 +84,7 @@ def objective(trial, all_bags, train_ids, val_ids, device, epochs=35, model_type
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
-        # Evaluace na validační sadě
+        # Validation evaluation
         model.eval()
         val_preds, val_truths = [], []
         val_loss_sum = 0.0
@@ -107,21 +116,25 @@ def objective(trial, all_bags, train_ids, val_ids, device, epochs=35, model_type
 
     return best_val_macro_f1
 
+
 def main():
-    parser = argparse.ArgumentParser(description="Optuna Hyperparameter Search pro AMICO modely (LigandCrossAttentionMIL / SelfAttentionMIL)")
-    parser.add_argument('--model', type=str, default='ligand_cross_mil', choices=['ligand_cross_mil', 'self_attention_mil', 'self_att'], help='Architektura modelu')
-    parser.add_argument('--n-trials', type=int, default=50)
-    parser.add_argument('--epochs', type=int, default=35)
-    parser.add_argument('--split-suffix', type=str, default='mil_0.5')
-    parser.add_argument('--pockets-path', default='data_prep/esm_dataset.pt')
-    parser.add_argument('--full-proteins-path', default='data_prep/esm_full_proteins.pt')
+    parser = argparse.ArgumentParser(description="Optuna Hyperparameter Search for AMICO Models (LigandCrossAttentionMIL / SelfAttentionMIL)")
+    parser.add_argument('--model', type=str, default='ligand_cross_mil', choices=['ligand_cross_mil', 'self_attention_mil', 'self_att'], help='Target model architecture')
+    parser.add_argument('--n-trials', type=int, default=50, help='Total number of Optuna trials')
+    parser.add_argument('--epochs', type=int, default=35, help='Training epochs per trial')
+    parser.add_argument('--split-suffix', type=str, default='mil_0.5', help='Dataset split suffix')
+    parser.add_argument('--pockets-path', default='data_prep/esm_dataset.pt', help='Path to pocket embeddings dataset')
+    parser.add_argument('--full-proteins-path', default='data_prep/esm_full_proteins.pt', help='Path to full protein embeddings')
     args = parser.parse_args()
+
+    if optuna is None:
+        raise ImportError("Optuna is not installed. Please install it using: pip install optuna")
 
     if args.model == 'self_att':
         args.model = 'self_attention_mil'
 
     device = torch.device('cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'))
-    print(f"Zařízení: {device} | Model: {args.model}")
+    print(f"Device: {device} | Model: {args.model}")
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
     pockets_path = os.path.join(base_dir, args.pockets_path) if not os.path.isabs(args.pockets_path) else args.pockets_path
@@ -158,23 +171,24 @@ def main():
             }
             with open(out_json, 'w') as f:
                 json.dump(best_dict, f, indent=4)
-            print(f"\n>>> Nový nejlepší trial #{trial.number} (Val Macro F1: {study.best_value:.4f}) uložen do {out_json}")
+            print(f"\n>>> New best trial #{trial.number} (Val Macro F1: {study.best_value:.4f}) saved to {out_json}")
 
-    print(f"\nSpouštím {args.n_trials} trialů pro {args.model} (databáze: {db_name})...")
+    print(f"\nRunning {args.n_trials} trials for {args.model} (Database: {db_name})...")
     study.optimize(
         lambda trial: objective(trial, all_bags, train_ids, val_ids, device, epochs=args.epochs, model_type=args.model),
         n_trials=args.n_trials,
         callbacks=[save_best_callback]
     )
 
-    print("\n" + "="*50)
-    print("      OPTUNA DOKONČENA     ")
-    print("="*50)
+    print("\n" + "=" * 50)
+    print("      OPTUNA OPTIMIZATION COMPLETED     ")
+    print("=" * 50)
     print(f"Model: {args.model}")
-    print(f"Nejlepší Val Macro F1: {study.best_value:.4f}")
-    print("Nejlepší parametry:")
+    print(f"Best Val Macro F1: {study.best_value:.4f}")
+    print("Best Parameters:")
     for k, v in study.best_params.items():
         print(f" - {k}: {v}")
+
 
 if __name__ == '__main__':
     main()
