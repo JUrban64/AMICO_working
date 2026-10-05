@@ -89,7 +89,7 @@ def train_ligand_cross_att(
     pockets_full = os.path.join(base_dir, pockets_path) if not os.path.isabs(pockets_path) else pockets_path
     full_prot_full = os.path.join(base_dir, full_proteins_path) if not os.path.isabs(full_proteins_path) else full_proteins_path
 
-    all_bags = load_cross_mil_data(pockets_full, full_prot_full, mode='pockets')
+    all_bags, prep_cfg = load_cross_mil_data(pockets_full, full_prot_full, mode='pockets', return_config=True)
     train_ids, val_ids, test_ids = load_split_ids(base_dir, split_suffix=split_suffix)
 
     train_bags, val_bags, test_bags = [], [], []
@@ -171,7 +171,12 @@ def train_ligand_cross_att(
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_weights = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            torch.save(best_weights, save_model)
+            torch.save({
+                'model_state_dict': best_weights,
+                'model_type': 'ligand_cross_mil',
+                'hparams': {'hidden_dim': hidden_dim, 'num_heads': num_heads, 'dropout': dropout, 'ecfp_dim': 2048},
+                'preprocessing': prep_cfg,
+            }, save_model)
             save_msg = "🔥 (Model saved)"
         else:
             save_msg = ""

@@ -139,8 +139,9 @@ def main():
 
     print(f"-> Total proteins to verify / process: {len(unique_pids)}.")
 
-    # 4. Initialize ESM model
-    extractor = ESMFeatureExtractor(model_name=args.model_name, device=args.device)
+    # 4. Initialize ESM model (sequences > 1022 aa are embedded in overlapping windows, not truncated)
+    extractor = ESMFeatureExtractor(model_name=args.model_name, device=args.device,
+                                    long_sequences='chunk', verbose=False)
 
     missing_pdbs = 0
     newly_processed = 0
@@ -187,6 +188,8 @@ def main():
     torch.save(full_embeddings_dict, out_path)
     print("\n" + "=" * 50)
     print(f"✅ Completed! Saved {len(full_embeddings_dict)} protein embeddings to {out_path}")
+    if extractor.num_long_sequences:
+        print(f"ℹ️  {extractor.num_long_sequences} sequence(s) exceeded 1022 aa and were embedded in overlapping windows.")
     if missing_pdbs > 0:
         print(f"⚠️ Warning: For {missing_pdbs} IDs, PDB files were not found on disk.")
     print("=" * 50)

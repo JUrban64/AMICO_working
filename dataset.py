@@ -5,6 +5,8 @@ from torch.nn.utils.rnn import pad_sequence
 import numpy as np
 from collections import defaultdict
 
+from preprocessing import config_from_records, describe
+
 TARGET_NAMES = ['acetyl-CoA', 'ATP', 'B12', 'FAD', 'NAD']
 
 def load_split_ids(base_dir, split_suffix='_mil_0.5', use_nr=False):
@@ -62,12 +64,19 @@ def match_id(pid, id_set):
     return base in id_set
 
 
-def load_cross_mil_data(pockets_path, full_proteins_path, mode='pockets'):
+def load_cross_mil_data(pockets_path, full_proteins_path, mode='pockets', return_config=False):
     """
     Loads ESM pocket embeddings and ESM whole-protein embeddings, pairing them into MIL bags.
+
+    If return_config is True, returns (bag_list, preprocessing_config), where the config
+    describes how the features were built (min_prob, pocket_embedding, ...). Datasets built
+    before configs were recorded are reported as LEGACY_PREPROCESSING.
     """
     print(f"Loading pocket features from {pockets_path}...")
     raw_pockets = torch.load(pockets_path, weights_only=False)
+    prep_cfg = config_from_records(raw_pockets)
+    if prep_cfg is not None:
+        print(f"Dataset preprocessing: {describe(prep_cfg)}")
     
     print(f"Loading full protein features from {full_proteins_path}...")
     full_proteins = torch.load(full_proteins_path, weights_only=False)
@@ -125,6 +134,8 @@ def load_cross_mil_data(pockets_path, full_proteins_path, mode='pockets'):
         })
         
     print(f"Successfully loaded {len(bag_list)} paired protein bags.")
+    if return_config:
+        return bag_list, prep_cfg
     return bag_list
 
 

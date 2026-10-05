@@ -8,6 +8,10 @@ import numpy as np
 from model_ligand_cross_att import LigandCrossAttentionMIL, TARGET_NAMES
 from model_self_attention import SelfAttentionMIL
 from p2rank_utils import run_p2rank, parse_p2rank_output, find_p2rank_executable
+from preprocessing import (
+    DEFAULT_ESM_MODEL, DEFAULT_MIN_PROB, DEFAULT_POCKET_EMBEDDING,
+    DEFAULT_LONG_SEQUENCES, LEGACY_PREPROCESSING, describe,
+)
 
 
 class AMICOPredictor:
@@ -43,11 +47,24 @@ class AMICOPredictor:
                 checkpoint_path = candidate_weights
 
         # Load weights and auto-detect architecture if requested
+        self.preprocessing = dict(LEGACY_PREPROCESSING)
         loaded_state = None
         ecfp_dim = 2048
         if checkpoint_path and os.path.exists(checkpoint_path):
             state = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
             if isinstance(state, dict):
+                # Load preprocessing settings if stored in checkpoint
+                if 'preprocessing' in state and isinstance(state['preprocessing'], dict):
+                    self.preprocessing.update(state['preprocessing'])
+                    print(f"-> Checkpoint preprocessing settings: {describe(self.preprocessing)}")
+                if 'hparams' in state and isinstance(state['hparams'], dict):
+                    hp = state['hparams']
+                    hidden_dim = hp.get('hidden_dim', hidden_dim)
+                    num_heads = hp.get('num_heads', num_heads)
+                    dropout = hp.get('dropout', dropout)
+                    ecfp_dim = hp.get('ecfp_dim', ecfp_dim)
+                if 'model_type' in state and model_type == 'auto':
+                    model_type = state['model_type']
                 if 'model_state_dict' in state:
                     state = state['model_state_dict']
                 elif 'state_dict' in state:
@@ -66,6 +83,11 @@ class AMICOPredictor:
             # Auto-detect ECFP dimension from checkpoint if available
             if 'ligand_proj.0.weight' in loaded_state:
                 ecfp_dim = loaded_state['ligand_proj.0.weight'].shape[1]
+
+        self.default_min_prob = self.preprocessing.get('min_prob', DEFAULT_MIN_PROB)
+        self.default_pocket_embedding = self.preprocessing.get('pocket_embedding', DEFAULT_POCKET_EMBEDDING)
+        self.long_sequences = self.preprocessing.get('long_sequences', DEFAULT_LONG_SEQUENCES)
+        self.default_esm_model = self.preprocessing.get('esm_model', DEFAULT_ESM_MODEL)
 
         # Initialize chosen architecture
         if model_type in ['self_attention_mil', 'self_att']:
@@ -97,11 +119,17 @@ class AMICOPredictor:
         self.model.eval()
         self._esm_extractor = None
 
-    def _get_esm_extractor(self, model_name="facebook/esm2_t33_650M_UR50D"):
+    def _get_esm_extractor(self, model_name=None, long_sequences=None):
         """Lazy initialization of ESM-2 feature extractor."""
-        if self._esm_extractor is None:
+        model_name = model_name or self.default_esm_model
+        long_sequences = long_sequences or self.long_sequences
+        if self._esm_extractor is None or getattr(self._esm_extractor, 'long_sequences', None) != long_sequences:
             from esm_extractor import ESMFeatureExtractor
-            self._esm_extractor = ESMFeatureExtractor(model_name=model_name, device=self.device)
+            self._esm_extractor = ESMFeatureExtractor(
+                model_name=model_name,
+                device=self.device,
+                long_sequences=long_sequences
+            )
         return self._esm_extractor
 
     def _enable_mc_dropout(self):
@@ -142,8 +170,13 @@ class AMICOPredictor:
         pocket_features = pocket_features.to(self.device)
         full_protein_feature = full_protein_feature.to(self.device)
         
+        has_pockets = (pocket_features.size(1) > 0)
         num_pockets = pocket_features.size(1)
         padding_mask = torch.zeros(1, num_pockets, dtype=torch.bool, device=self.device)
+
+        if not has_pockets:
+            print("⚠️  [AMICO] Protein has 0 pockets meeting the min_prob threshold.")
+            print("    Note: Training bags always contain >= 1 pocket. Evaluating with global context only (OOD fallback).")
 
         if mc_samples > 1:
             # === MONTE CARLO DROPOUT MODE ===
@@ -175,8 +208,12 @@ class AMICOPredictor:
             uncertainty = float(std_probs[pred_idx])
             
             # Non-binder / Out-of-Distribution protein detection
-            is_non_binder = (confidence < confidence_threshold) or (uncertainty > uncertainty_threshold)
-            binding_status = "NON_BINDER / UNKNOWN_COFACTOR" if is_non_binder else "BINDER"
+            if not has_pockets:
+                is_non_binder = True
+                binding_status = "NON_BINDER / NO_POCKETS"
+            else:
+                is_non_binder = (confidence < confidence_threshold) or (uncertainty > uncertainty_threshold)
+                binding_status = "NON_BINDER / UNKNOWN_COFACTOR" if is_non_binder else "BINDER"
 
             probs_dict = {
                 TARGET_NAMES[i]: {
@@ -200,8 +237,13 @@ class AMICOPredictor:
             confidence = float(probs[pred_idx])
             uncertainty = 0.0
             predictive_entropy = -float(np.sum(probs * np.log(probs + 1e-12)))
-            is_non_binder = confidence < confidence_threshold
-            binding_status = "NON_BINDER / UNKNOWN_COFACTOR" if is_non_binder else "BINDER"
+
+            if not has_pockets:
+                is_non_binder = True
+                binding_status = "NON_BINDER / NO_POCKETS"
+            else:
+                is_non_binder = confidence < confidence_threshold
+                binding_status = "NON_BINDER / UNKNOWN_COFACTOR" if is_non_binder else "BINDER"
 
             probs_dict = {
                 TARGET_NAMES[i]: {
@@ -236,10 +278,16 @@ class AMICOPredictor:
             for i, w in sorted(enumerate(pocket_attn_weights), key=lambda x: x[1], reverse=True)
         ]
 
+        if not has_pockets:
+            predicted_cofactor = "NONE (No binding pocket detected)"
+        else:
+            predicted_cofactor = "NONE (Non-binder)" if is_non_binder else pred_label
+
         return {
-            "predicted_cofactor": "NONE (Non-binder)" if is_non_binder else pred_label,
+            "predicted_cofactor": predicted_cofactor,
             "raw_top_class": pred_label,
             "binding_status": binding_status,
+            "has_pockets": has_pockets,
             "confidence": round(confidence, 4),
             "uncertainty_std": round(uncertainty, 4),
             "predictive_entropy": round(predictive_entropy, 4),
@@ -253,8 +301,8 @@ class AMICOPredictor:
             "pocket_rankings": pocket_rankings
         }
 
-    def predict_from_pdb(self, pdb_path, prank_exec=None, prank_out_dir=None, min_prob=0.0,
-                         esm_model="facebook/esm2_t33_650M_UR50D", mc_samples=30,
+    def predict_from_pdb(self, pdb_path, prank_exec=None, prank_out_dir=None, min_prob=None,
+                         esm_model=None, pocket_embedding=None, mc_samples=30,
                          confidence_threshold=0.50, uncertainty_threshold=0.15):
         """
         End-to-End prediction from a PDB structure:
@@ -268,6 +316,13 @@ class AMICOPredictor:
         if not pdb_path.exists():
             raise FileNotFoundError(f"PDB file not found: {pdb_path}")
 
+        if min_prob is None:
+            min_prob = self.default_min_prob
+        if esm_model is None:
+            esm_model = self.default_esm_model
+        if pocket_embedding is None:
+            pocket_embedding = self.default_pocket_embedding
+
         # 1. P2Rank
         if prank_out_dir and Path(prank_out_dir).exists():
             out_dir = Path(prank_out_dir)
@@ -276,15 +331,21 @@ class AMICOPredictor:
             out_dir = run_p2rank(pdb_path, prank_exec=prank_exec)
 
         # 2. Parse pockets
-        print(f"-> Parsing predicted pockets from {out_dir}...")
+        print(f"-> Parsing predicted pockets from {out_dir} (min_prob >= {min_prob})...")
         parsed_data = parse_p2rank_output(out_dir, pdb_path, min_prob=min_prob)
         pockets = parsed_data['pockets']
         print(f"-> Found {len(pockets)} candidate pockets (min_prob >= {min_prob}).")
+        if len(pockets) == 0:
+            print(f"⚠️  [WARNING] No pockets detected with P2Rank probability >= {min_prob}.")
+            print("    Note: AMICO was trained exclusively on proteins with >= 1 pocket.")
+            print("    Evaluating protein as NON-BINDER / NO_POCKETS.")
 
         # 3. ESM-2 extraction
         extractor = self._get_esm_extractor(model_name=esm_model)
-        print("-> Generating ESM-2 embeddings...")
-        pocket_features, full_protein_feature = extractor.extract_all_from_parsed(parsed_data)
+        print(f"-> Generating ESM-2 embeddings (pocket embedding: {pocket_embedding})...")
+        feats = extractor.extract_features(parsed_data, pocket_embedding=pocket_embedding)
+        pocket_features = feats['pocket_features']
+        full_protein_feature = feats['full_protein_feature']
 
         # 4. AMICO model inference
         print(f"-> Running {self.model_type} inference...")
@@ -356,7 +417,8 @@ def main():
     parser.add_argument('--pdb', type=str, default=None, help='Path to target protein PDB structure file')
     parser.add_argument('--prank', type=str, default=None, help='Path to P2Rank prank binary (default: auto-detected)')
     parser.add_argument('--p2rank-dir', type=str, default=None, help='Path to existing P2Rank output directory')
-    parser.add_argument('--min-prob', type=float, default=0.0, help='Minimum P2Rank pocket probability threshold (0.0 = all)')
+    parser.add_argument('--min-prob', type=float, default=None, help='Minimum P2Rank pocket probability threshold (default: from checkpoint or 0.30)')
+    parser.add_argument('--pocket-embedding', type=str, default=None, choices=['slice', 'concat'], help='Pocket embedding strategy: slice (default, from full-protein ESM pass) or concat (legacy)')
     parser.add_argument('--esm-model', type=str, default='facebook/esm2_t33_650M_UR50D', help='HuggingFace ESM-2 model identifier')
 
     parser.add_argument(
@@ -411,6 +473,7 @@ def main():
             prank_out_dir=args.p2rank_dir,
             min_prob=args.min_prob,
             esm_model=args.esm_model,
+            pocket_embedding=args.pocket_embedding,
             mc_samples=args.mc_samples,
             confidence_threshold=args.confidence_thresh,
             uncertainty_threshold=args.uncertainty_thresh
@@ -451,7 +514,12 @@ def main():
         print(f" -> Model Attention Focus:           Pocket #{res['best_binding_pocket']} (Attention: {res['best_pocket_attention']:.4f})")
         print(f" -> Global Enzyme Influence:         {res['global_context_weight']:.4f}")
     else:
-        print("\n⚠️ Model classified protein as NON-BINDER (True Negative) or prediction is below confidence threshold.")
+        if not res.get('has_pockets', True):
+            print("\n⚠️  [OUT OF DISTRIBUTION] Protein has 0 pockets detected above the probability threshold.")
+            print("   AMICO was trained exclusively on proteins with >= 1 binding pocket.")
+            print("   Evaluating protein as NON-BINDER (No Pockets / True Negative).")
+        else:
+            print("\n⚠️ Model classified protein as NON-BINDER (True Negative) or prediction is below confidence threshold.")
 
     print("\nCofactor Probabilities:")
     for name, p_data in res['probabilities'].items():

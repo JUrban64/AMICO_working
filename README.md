@@ -15,7 +15,7 @@ pip install -r requirements.txt
 *Requirements:* Python ≥ 3.10, PyTorch ≥ 2.0.
 *Optional external tools:*
 - [P2Rank](https://github.com/rdkit/p2rank) (bundled in `p2rank_2.5.1/`, requires Java JRE/JDK ≥ 11 for pocket prediction from raw PDBs).
-- [Foldseek](https://github.com/steineggerlab/foldseek) (required in `PATH` for structural clustering and Foldseek benchmarks).
+- [Foldseek](https://github.com/steineggerlab/foldseek) (required in `PATH` for structural clustering and Foldseek benchmarks: `conda install -c conda-forge -c bioconda foldseek`).
 - [AutoDock Vina](https://vina.scripps.edu/) (optional for downstream docking: `pip install vina` or system binary).
 
 ---

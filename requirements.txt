@@ -21,3 +21,7 @@ optuna>=3.0.0
 
 # Optional: Downstream Docking (AutoDock Vina)
 # vina>=1.2.5
+
+# External Tools / Binary Dependencies (via Conda):
+# Structural Clustering & Benchmark (Foldseek):
+# conda install -c conda-forge -c bioconda foldseek

@@ -14,6 +14,10 @@ if root_dir not in sys.path:
 
 from p2rank_utils import parse_p2rank_output
 from esm_extractor import ESMFeatureExtractor
+from preprocessing import (
+    DEFAULT_ESM_MODEL, DEFAULT_MIN_PROB, DEFAULT_POCKET_EMBEDDING, POCKET_EMBEDDING_MODES,
+    make_preprocessing_config, config_from_records, describe,
+)
 
 TARGET_NAMES = ['acetyl-CoA', 'ATP', 'B12', 'FAD', 'NAD']
 NAME_TO_LABEL = {name: i for i, name in enumerate(TARGET_NAMES)}
@@ -73,14 +77,23 @@ def main():
     parser.add_argument('--pdb-dir', type=str, default=default_pdb_dir, help='Folder containing PDB structures (structures/all_pdbs)')
     parser.add_argument('--metadata', type=str, default=default_metadata, help='Path to dataset_metadata.tsv')
     parser.add_argument('--out-path', type=str, default=default_out, help='Output file path for esm_dataset.pt')
-    parser.add_argument('--min-prob', type=float, default=0.30, help='Minimum P2Rank pocket probability threshold (default: 0.30)')
-    parser.add_argument('--esm-model', type=str, default='facebook/esm2_t33_650M_UR50D', help='HuggingFace ESM-2 model identifier')
+    parser.add_argument('--min-prob', type=float, default=DEFAULT_MIN_PROB, help=f'Minimum P2Rank pocket probability threshold (default: {DEFAULT_MIN_PROB})')
+    parser.add_argument('--pocket-embedding', type=str, default=DEFAULT_POCKET_EMBEDDING, choices=POCKET_EMBEDDING_MODES,
+                        help="'slice' = pool pocket residues from the full-protein ESM pass (default); 'concat' = legacy residue-string embedding")
+    parser.add_argument('--esm-model', type=str, default=DEFAULT_ESM_MODEL, help='HuggingFace ESM-2 model identifier')
     parser.add_argument('--device', type=str, default=None, help='Compute device for ESM (cuda, mps, cpu)')
     parser.add_argument('--save-interval', type=int, default=100, help='Checkpoint saving interval')
     parser.add_argument('--limit', type=int, default=None, help='Limit number of processed proteins for testing')
     args = parser.parse_args()
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out_path)), exist_ok=True)
+
+    prep_cfg = make_preprocessing_config(
+        min_prob=args.min_prob,
+        pocket_embedding=args.pocket_embedding,
+        long_sequences='chunk',
+        esm_model=args.esm_model,
+    )
 
     print("=" * 65)
     print("AMICO: POCKET EMBEDDINGS GENERATOR (FROM P2RANK OUTPUTS)")
@@ -89,7 +102,7 @@ def main():
     print(f"PDB directory:   {args.pdb_dir}")
     print(f"Metadata file:   {args.metadata}")
     print(f"Output path:     {args.out_path}")
-    print(f"Min probability: {args.min_prob}")
+    print(f"Preprocessing:   {describe(prep_cfg)}")
     print("=" * 65)
 
     # 1. Load metadata
@@ -102,6 +115,14 @@ def main():
     if os.path.exists(args.out_path):
         print(f"-> Found existing pocket dataset in {args.out_path}, loading for resume...")
         existing_pockets = torch.load(args.out_path, weights_only=False)
+        if existing_pockets:
+            existing_cfg = config_from_records(existing_pockets)
+            if existing_cfg != prep_cfg:
+                print("❌ Existing pocket dataset was built with different preprocessing settings:")
+                print(f"   existing:  {describe(existing_cfg)}")
+                print(f"   requested: {describe(prep_cfg)}")
+                print("   Delete/rename the file or pass a new --out-path.")
+                return
         for item in existing_pockets:
             raw_pid = item['protein_id']
             base_name = os.path.basename(raw_pid)
@@ -154,11 +175,13 @@ def main():
 
     # 4. Initialize ESM Feature Extractor
     print(f"\n-> Initializing ESM Feature Extractor ({args.esm_model})...")
-    extractor = ESMFeatureExtractor(model_name=args.esm_model, device=args.device)
+    extractor = ESMFeatureExtractor(model_name=args.esm_model, device=args.device,
+                                    long_sequences=prep_cfg['long_sequences'], verbose=False)
 
     new_pockets_list = list(existing_pockets)
     new_counter = 0
     missing_prank = 0
+    no_pocket_count = 0
 
     pbar = tqdm(queue, desc="ESM-2 Pocket Extraction")
     for pdb_path, meta in pbar:
@@ -167,28 +190,21 @@ def main():
 
         try:
             parsed = parse_p2rank_output(args.prank_dir, pdb_path, min_prob=args.min_prob)
-            pockets = parsed['pockets']
+            feats = extractor.extract_features(parsed, pocket_embedding=args.pocket_embedding)
+            if not feats['pockets']:
+                no_pocket_count += 1
 
-            pocket_seqs = [p['sequence'] for p in pockets if p.get('sequence')]
-            if pocket_seqs:
-                pocket_embs = extractor.extract_pocket_embeddings(pocket_seqs)  # [N, 1280]
-
-                valid_idx = 0
-                for p_info in pockets:
-                    if not p_info.get('sequence'):
-                        continue
-                    p_feat = pocket_embs[valid_idx]  # [1280]
-                    valid_idx += 1
-
-                    new_pockets_list.append({
-                        'protein_id': f"{stem}_pocket_{p_info['pocket_id']}.pdb",
-                        'features': p_feat,
-                        'label': label,
-                        'probability': p_info.get('probability', 0.0),
-                        'score': p_info.get('score', 0.0),
-                        'center': p_info.get('center', [0.0, 0.0, 0.0]),
-                        'residue_count': p_info.get('residue_count', len(p_info.get('sequence', '')))
-                    })
+            for p_info, p_feat in zip(feats['pockets'], feats['pocket_features']):
+                new_pockets_list.append({
+                    'protein_id': f"{stem}_pocket_{p_info['pocket_id']}.pdb",
+                    'features': p_feat,
+                    'label': label,
+                    'probability': p_info.get('probability', 0.0),
+                    'score': p_info.get('score', 0.0),
+                    'center': p_info.get('center', [0.0, 0.0, 0.0]),
+                    'residue_count': p_info.get('residue_count', len(p_info.get('sequence', ''))),
+                    'preprocessing': prep_cfg,
+                })
 
             new_counter += 1
 
@@ -205,6 +221,10 @@ def main():
     print("\n" + "=" * 65)
     print("✅ COMPLETED!")
     print(f"Total pockets saved to {args.out_path}: {len(new_pockets_list)}")
+    if extractor.num_long_sequences:
+        print(f"ℹ️  {extractor.num_long_sequences} sequence(s) exceeded 1022 aa and were embedded in overlapping windows.")
+    if no_pocket_count:
+        print(f"⚠️  {no_pocket_count} protein(s) had no pocket with probability >= {args.min_prob} and are excluded from training.")
     if missing_prank > 0:
         print(f"⚠️ Warning: For {missing_prank} proteins, P2Rank outputs were not found in {args.prank_dir}.")
     print("=" * 65)

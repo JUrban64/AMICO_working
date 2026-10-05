@@ -13,8 +13,12 @@ root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if root_dir not in sys.path:
     sys.path.insert(0, root_dir)
 
-from p2rank_utils import run_p2rank, run_p2rank_batch, parse_p2rank_output, find_p2rank_executable
+from p2rank_utils import run_p2rank, run_p2rank_batch, parse_p2rank_output, find_p2rank_executable, get_full_sequence_from_pdb
 from esm_extractor import ESMFeatureExtractor
+from preprocessing import (
+    DEFAULT_ESM_MODEL, DEFAULT_MIN_PROB, DEFAULT_POCKET_EMBEDDING, POCKET_EMBEDDING_MODES,
+    make_preprocessing_config, config_from_records, describe,
+)
 
 TARGET_NAMES = ['acetyl-CoA', 'ATP', 'B12', 'FAD', 'NAD']
 NAME_TO_LABEL = {name: i for i, name in enumerate(TARGET_NAMES)}
@@ -86,9 +90,11 @@ def main():
     parser.add_argument('--config', type=str, default='alphafold', help='P2Rank configuration (alphafold / default)')
     parser.add_argument('--threads', type=int, default=8, help='Number of CPU threads for P2Rank')
     parser.add_argument('--chunk-size', type=int, default=500, help='Batch size for batch P2Rank processing')
-    parser.add_argument('--esm-model', type=str, default='facebook/esm2_t33_650M_UR50D', help='HuggingFace ESM-2 model identifier')
+    parser.add_argument('--esm-model', type=str, default=DEFAULT_ESM_MODEL, help='HuggingFace ESM-2 model identifier')
     parser.add_argument('--device', type=str, default=None, help='Compute device for ESM (cuda, mps, cpu)')
-    parser.add_argument('--min-prob', type=float, default=0.30, help='Minimum P2Rank pocket probability threshold')
+    parser.add_argument('--min-prob', type=float, default=DEFAULT_MIN_PROB, help=f'Minimum P2Rank pocket probability threshold (default: {DEFAULT_MIN_PROB})')
+    parser.add_argument('--pocket-embedding', type=str, default=DEFAULT_POCKET_EMBEDDING, choices=POCKET_EMBEDDING_MODES,
+                        help="'slice' = pool pocket residues from the full-protein ESM pass (default); 'concat' = legacy residue-string embedding")
     parser.add_argument('--skip-p2rank', action='store_true', help='Skip running P2Rank (reuse existing prediction CSV files)')
     parser.add_argument('--pockets-only', action='store_true', help='Generate only esm_dataset.pt (skip whole-protein embeddings)')
     parser.add_argument('--full-only', action='store_true', help='Generate only esm_full_proteins.pt (skip pockets)')
@@ -100,6 +106,14 @@ def main():
     os.makedirs(os.path.dirname(os.path.abspath(args.pockets_out)), exist_ok=True)
     os.makedirs(os.path.dirname(os.path.abspath(args.full_proteins_out)), exist_ok=True)
 
+    # Settings stamped on every record and later copied into training checkpoints.
+    prep_cfg = make_preprocessing_config(
+        min_prob=args.min_prob,
+        pocket_embedding=args.pocket_embedding,
+        long_sequences='chunk',
+        esm_model=args.esm_model,
+    )
+
     print("=" * 65)
     print("AMICO: DATA PREPARATION PIPELINE (P2Rank + ESM-2)")
     print("=" * 65)
@@ -108,6 +122,7 @@ def main():
     print(f"Pockets output:   {args.pockets_out}")
     print(f"Full output:      {args.full_proteins_out}")
     print(f"P2Rank threads:   {args.threads} | Config: {args.config} | Chunk: {args.chunk_size}")
+    print(f"Preprocessing:    {describe(prep_cfg)}")
     if args.skip_p2rank:
         print("⚡ P2Rank run:     SKIPPED (reusing existing CSV outputs)")
     print("=" * 65)
@@ -122,6 +137,15 @@ def main():
     if os.path.exists(args.pockets_out):
         print(f"-> Found existing pocket dataset in {args.pockets_out}, loading...")
         existing_pockets = torch.load(args.pockets_out, weights_only=False)
+        if existing_pockets:
+            existing_cfg = config_from_records(existing_pockets)
+            if existing_cfg != prep_cfg:
+                print("❌ Existing pocket dataset was built with different preprocessing settings:")
+                print(f"   existing:  {describe(existing_cfg)}")
+                print(f"   requested: {describe(prep_cfg)}")
+                print("   Resuming would mix representations. Delete/rename both output files "
+                      "(esm_dataset.pt and esm_full_proteins.pt) or pass new --pockets-out/--full-proteins-out paths.")
+                return
         for item in existing_pockets:
             raw_pid = item['protein_id']
             base_name = os.path.basename(raw_pid)
@@ -203,52 +227,55 @@ def main():
     elif args.skip_p2rank and not args.full_only:
         print(f"\n⚡ Skipping P2Rank execution (--skip-p2rank). Reusing CSV predictions from {args.prank_out_dir}")
 
-    # 5. Initialize ESM feature extractor
+    # 5. Initialize ESM feature extractor (long sequences are windowed, not truncated)
     print("\n-> Initializing ESM Feature Extractor...")
-    extractor = ESMFeatureExtractor(model_name=args.esm_model, device=args.device)
+    extractor = ESMFeatureExtractor(model_name=args.esm_model, device=args.device,
+                                    long_sequences=prep_cfg['long_sequences'], verbose=False)
 
     new_pockets_list = list(existing_pockets)
     new_counter = 0
+    no_pocket_pids = []
+
+    def store_full(stem, full_emb):
+        full_proteins_dict[stem] = full_emb
+        clean_acc = stem.split('_')[0]
+        if clean_acc not in full_proteins_dict:
+            full_proteins_dict[clean_acc] = full_emb
 
     pbar = tqdm(queue, desc="ESM-2 Extraction (pockets & proteins)")
     for pdb_path, meta in pbar:
         stem = meta['stem']
         label = meta['label']
+        need_pockets = (not args.full_only) and (stem not in processed_pids)
+        need_full = (not args.pockets_only) and (stem not in full_proteins_dict)
 
         try:
-            # Extract whole-protein embedding
-            if not args.pockets_only and stem not in full_proteins_dict:
-                from p2rank_utils import get_full_sequence_from_pdb
+            if need_pockets:
+                # One ESM pass yields both the global embedding and the pocket embeddings.
+                parsed = parse_p2rank_output(args.prank_out_dir, pdb_path, min_prob=args.min_prob)
+                feats = extractor.extract_features(parsed, pocket_embedding=args.pocket_embedding)
+
+                if not args.pockets_only:
+                    store_full(stem, feats['full_protein_feature'])
+
+                if not feats['pockets']:
+                    no_pocket_pids.append(stem)
+
+                for p_info, p_feat in zip(feats['pockets'], feats['pocket_features']):
+                    new_pockets_list.append({
+                        'protein_id': f"{stem}_pocket_{p_info['pocket_id']}.pdb",
+                        'features': p_feat,
+                        'label': label,
+                        'probability': p_info.get('probability', 0.0),
+                        'score': p_info.get('score', 0.0),
+                        'center': p_info.get('center', [0.0, 0.0, 0.0]),
+                        'residue_count': p_info.get('residue_count', len(p_info.get('sequence', ''))),
+                        'preprocessing': prep_cfg,
+                    })
+            elif need_full:
                 full_seq, _, _ = get_full_sequence_from_pdb(pdb_path)
                 if full_seq:
-                    full_emb = extractor.extract_sequence_embedding(full_seq)  # [1280]
-                    full_proteins_dict[stem] = full_emb
-                    clean_acc = stem.split('_')[0]
-                    if clean_acc not in full_proteins_dict:
-                        full_proteins_dict[clean_acc] = full_emb
-
-            # Parse pockets and extract pocket embeddings
-            if not args.full_only:
-                parsed = parse_p2rank_output(args.prank_out_dir, pdb_path, min_prob=args.min_prob)
-                pockets = parsed['pockets']
-                pocket_seqs = [p['sequence'] for p in pockets if p.get('sequence')]
-                if pocket_seqs:
-                    pocket_embs = extractor.extract_pocket_embeddings(pocket_seqs)  # [N, 1280]
-                    valid_idx = 0
-                    for p_info in pockets:
-                        if not p_info.get('sequence'):
-                            continue
-                        p_feat = pocket_embs[valid_idx]  # [1280]
-                        valid_idx += 1
-                        new_pockets_list.append({
-                            'protein_id': f"{stem}_pocket_{p_info['pocket_id']}.pdb",
-                            'features': p_feat,
-                            'label': label,
-                            'probability': p_info.get('probability', 0.0),
-                            'score': p_info.get('score', 0.0),
-                            'center': p_info.get('center', [0.0, 0.0, 0.0]),
-                            'residue_count': p_info.get('residue_count', len(p_info.get('sequence', '')))
-                        })
+                    store_full(stem, extractor.extract_sequence_embedding(full_seq))
 
             new_counter += 1
 
@@ -268,6 +295,11 @@ def main():
     print("✅ COMPLETED!")
     print(f"Saved pockets to {args.pockets_out}: {len(new_pockets_list)}")
     print(f"Saved whole proteins to {args.full_proteins_out}: {len(full_proteins_dict)}")
+    if extractor.num_long_sequences:
+        print(f"ℹ️  {extractor.num_long_sequences} sequence(s) exceeded 1022 aa and were embedded in overlapping windows.")
+    if no_pocket_pids:
+        print(f"⚠️  {len(no_pocket_pids)} protein(s) had no pocket with probability >= {args.min_prob}. "
+              f"They produce no MIL bag and are excluded from training; predict.py flags such proteins as NO_POCKETS.")
     print("=" * 65)
 
 

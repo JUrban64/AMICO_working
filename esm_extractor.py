@@ -1,13 +1,27 @@
 import torch
 import numpy as np
 
+from preprocessing import (
+    DEFAULT_ESM_MODEL,
+    DEFAULT_LONG_SEQUENCES,
+    DEFAULT_POCKET_EMBEDDING,
+    LONG_SEQUENCE_MODES,
+    POCKET_EMBEDDING_MODES,
+)
+
+# ESM-2 has 1026 positions; <cls> and <eos> take two, leaving 1024. We keep the
+# historical 1024-token limit (incl. special tokens) -> 1022 residues per pass.
+ESM_MAX_RESIDUES = 1022
+CHUNK_OVERLAP = 256
+
 
 class ESMFeatureExtractor:
     """
     ESM-2 embedding extractor for whole-protein sequences and predicted binding pockets.
     Default model: facebook/esm2_t33_650M_UR50D (1280 dimensions).
     """
-    def __init__(self, model_name="facebook/esm2_t33_650M_UR50D", device=None):
+    def __init__(self, model_name=DEFAULT_ESM_MODEL, device=None,
+                 long_sequences=DEFAULT_LONG_SEQUENCES, verbose=True):
         try:
             from transformers import AutoTokenizer, EsmModel
         except ImportError:
@@ -16,91 +30,176 @@ class ESMFeatureExtractor:
                 "Please install it using: pip install transformers"
             )
 
+        if long_sequences not in LONG_SEQUENCE_MODES:
+            raise ValueError(f"long_sequences must be one of {LONG_SEQUENCE_MODES}")
+
         if device is None:
             self.device = torch.device('cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'))
         else:
             self.device = torch.device(device)
 
+        self.long_sequences = long_sequences
+        self.verbose = verbose
+        self.num_long_sequences = 0  # how many sequences exceeded ESM_MAX_RESIDUES
+
         print(f"-> Loading ESM-2 model ({model_name}) on device {self.device}...")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = EsmModel.from_pretrained(model_name).to(self.device)
         self.model.eval()
+        self.hidden_size = self.model.config.hidden_size
 
-    def extract_sequence_embeddings_raw(self, sequence, max_length=1024):
-        """
-        Extracts per-residue embeddings for a given amino acid sequence.
-        
-        Returns:
-            torch.Tensor: [L, 1280]
-        """
-        if not sequence or len(sequence) == 0:
-            raise ValueError("Empty sequence provided to extract_sequence_embeddings_raw")
-
-        inputs = self.tokenizer(
-            sequence,
-            return_tensors="pt",
-            add_special_tokens=True,
-            truncation=True,
-            max_length=max_length
-        )
+    def _forward(self, sequence):
+        """Single ESM pass; caller guarantees len(sequence) <= ESM_MAX_RESIDUES."""
+        inputs = self.tokenizer(sequence, return_tensors="pt", add_special_tokens=True, truncation=False)
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
-
         with torch.no_grad():
             outputs = self.model(**inputs)
+        return outputs.last_hidden_state[0, 1:-1, :]  # drop <cls>/<eos> -> [L, D]
 
-        # Remove <cls> and <eos> tokens
-        embeddings = outputs.last_hidden_state[0, 1:-1, :]  # [L, 1280]
-        return embeddings
-
-    def extract_sequence_embedding(self, sequence):
+    def extract_sequence_embeddings_raw(self, sequence, long_sequences=None):
         """
-        Extracts global sequence embedding for a protein via mean pooling across residues.
-        
+        Per-residue embeddings for an amino acid sequence.
+
+        Sequences longer than ESM_MAX_RESIDUES are either embedded in overlapping
+        windows (long_sequences='chunk', full length returned) or truncated
+        (long_sequences='truncate', only the first ESM_MAX_RESIDUES returned).
+        Both cases are counted in self.num_long_sequences and reported when verbose.
+
         Returns:
-            torch.Tensor: [1280]
+            torch.Tensor: [L, D] (L = len(sequence), or ESM_MAX_RESIDUES if truncated)
         """
-        raw_emb = self.extract_sequence_embeddings_raw(sequence)
-        mean_emb = torch.mean(raw_emb, dim=0)  # [1280]
-        return mean_emb.cpu()
+        if not sequence:
+            raise ValueError("Empty sequence provided to extract_sequence_embeddings_raw")
 
-    def extract_pocket_embeddings(self, pocket_sequences):
+        mode = long_sequences or self.long_sequences
+        L = len(sequence)
+        if L <= ESM_MAX_RESIDUES:
+            return self._forward(sequence)
+
+        self.num_long_sequences += 1
+        if mode == 'truncate':
+            if self.verbose:
+                print(f"⚠️  [ESM] Sequence of {L} aa truncated to the first {ESM_MAX_RESIDUES} residues "
+                      f"({L - ESM_MAX_RESIDUES} residues not embedded).")
+            return self._forward(sequence[:ESM_MAX_RESIDUES])
+
+        window = ESM_MAX_RESIDUES
+        step = window - CHUNK_OVERLAP
+        starts = list(range(0, L - window, step)) + [L - window]
+        if self.verbose:
+            print(f"ℹ️  [ESM] Sequence of {L} aa exceeds {window} residues; "
+                  f"embedding in {len(starts)} overlapping windows.")
+
+        acc = torch.zeros(L, self.hidden_size, device=self.device)
+        counts = torch.zeros(L, 1, device=self.device)
+        for s in starts:
+            acc[s:s + window] += self._forward(sequence[s:s + window])
+            counts[s:s + window] += 1
+        return acc / counts
+
+    def extract_sequence_embedding(self, sequence, long_sequences=None):
         """
-        Extracts embeddings for a list of binding pocket sequences.
-        Performs mean pooling across residues for each individual pocket.
-        
-        Args:
-            pocket_sequences: list of strings (amino acid sequences for each pocket)
-            
+        Global protein embedding via mean pooling across residues.
+
         Returns:
-            torch.Tensor: [N_pockets, 1280]
+            torch.Tensor: [D]
+        """
+        raw_emb = self.extract_sequence_embeddings_raw(sequence, long_sequences=long_sequences)
+        return torch.mean(raw_emb, dim=0).cpu()
+
+    def extract_pocket_embeddings(self, pocket_sequences, long_sequences=None):
+        """
+        LEGACY ('concat' mode): embeds each pocket's residue string as if it were
+        a contiguous peptide and mean-pools it.
+
+        Returns:
+            torch.Tensor: [N_pockets, D]
         """
         if not pocket_sequences:
             return torch.empty((0, 1280), dtype=torch.float32)
 
         pocket_embs = []
         for seq in pocket_sequences:
-            if not seq or len(seq) == 0:
+            if not seq:
                 continue
-            raw_emb = self.extract_sequence_embeddings_raw(seq)
-            mean_emb = torch.mean(raw_emb, dim=0)  # [1280]
-            pocket_embs.append(mean_emb.cpu())
+            raw_emb = self.extract_sequence_embeddings_raw(seq, long_sequences=long_sequences)
+            pocket_embs.append(torch.mean(raw_emb, dim=0).cpu())
 
         if not pocket_embs:
             return torch.empty((0, 1280), dtype=torch.float32)
+        return torch.stack(pocket_embs, dim=0)
 
-        return torch.stack(pocket_embs, dim=0)  # [N, 1280]
+    @staticmethod
+    def pocket_residue_indices(pocket):
+        """0-based positions of the pocket's residues in the full parsed sequence."""
+        if pocket.get('residue_indices'):
+            return list(pocket['residue_indices'])
+        return [r['seq_idx'] for r in pocket.get('residues', []) if 'seq_idx' in r]
 
-    def extract_all_from_parsed(self, parsed_data):
+    def extract_features(self, parsed_data, pocket_embedding=DEFAULT_POCKET_EMBEDDING, long_sequences=None):
         """
-        Processes parsed P2Rank output and returns paired tensors for AMICO models.
-        
+        Computes the global protein embedding and one embedding per pocket.
+
+        pocket_embedding='slice' (default): a single ESM pass over the full
+            protein; each pocket is the mean of its residues' per-residue
+            embeddings, so residues keep their real sequence context.
+        pocket_embedding='concat' (legacy): pocket residue strings embedded
+            on their own.
+
         Returns:
-            tuple: (pocket_features [N, 1280], full_protein_feature [1280])
+            dict with
+              'full_protein_feature': [D] tensor
+              'pocket_features':      [N, D] tensor (row i <-> pockets[i])
+              'pockets':              list of pocket dicts that received a feature
+              'dropped_pocket_ids':   pocket ids that could not be embedded
         """
+        if pocket_embedding not in POCKET_EMBEDDING_MODES:
+            raise ValueError(f"pocket_embedding must be one of {POCKET_EMBEDDING_MODES}")
+
         full_seq = parsed_data['full_sequence']
-        full_protein_feature = self.extract_sequence_embedding(full_seq)
+        pockets = parsed_data.get('pockets', [])
+        kept, feats, dropped = [], [], []
 
-        pocket_seqs = [p['sequence'] for p in parsed_data['pockets']]
-        pocket_features = self.extract_pocket_embeddings(pocket_seqs)
+        if pocket_embedding == 'slice':
+            per_res = self.extract_sequence_embeddings_raw(full_seq, long_sequences=long_sequences)  # [L, D]
+            full_feature = per_res.mean(dim=0).cpu()
+            L = per_res.size(0)
+            for p in pockets:
+                idx = sorted({i for i in self.pocket_residue_indices(p) if 0 <= i < L})
+                if not idx:
+                    dropped.append(p.get('pocket_id'))
+                    continue
+                idx_t = torch.tensor(idx, dtype=torch.long, device=per_res.device)
+                feats.append(per_res.index_select(0, idx_t).mean(dim=0).cpu())
+                kept.append(p)
+        else:
+            full_feature = self.extract_sequence_embedding(full_seq, long_sequences=long_sequences)
+            for p in pockets:
+                seq = p.get('sequence')
+                if not seq:
+                    dropped.append(p.get('pocket_id'))
+                    continue
+                raw = self.extract_sequence_embeddings_raw(seq, long_sequences=long_sequences)
+                feats.append(raw.mean(dim=0).cpu())
+                kept.append(p)
 
-        return pocket_features, full_protein_feature
+        if dropped and self.verbose:
+            print(f"⚠️  [ESM] {len(dropped)} pocket(s) had no residues mappable to the sequence and were skipped: {dropped}")
+
+        pocket_features = torch.stack(feats, dim=0) if feats else torch.empty((0, full_feature.numel()), dtype=torch.float32)
+        return {
+            'full_protein_feature': full_feature,
+            'pocket_features': pocket_features,
+            'pockets': kept,
+            'dropped_pocket_ids': dropped,
+        }
+
+    def extract_all_from_parsed(self, parsed_data, pocket_embedding=DEFAULT_POCKET_EMBEDDING, long_sequences=None):
+        """
+        Backwards-compatible wrapper around extract_features().
+
+        Returns:
+            tuple: (pocket_features [N, D], full_protein_feature [D])
+        """
+        out = self.extract_features(parsed_data, pocket_embedding=pocket_embedding, long_sequences=long_sequences)
+        return out['pocket_features'], out['full_protein_feature']
