@@ -30,7 +30,6 @@ var/
 .DS_Store
 
 # Data and models
-*.pt
 *.pth
 *.npz
 *.ds

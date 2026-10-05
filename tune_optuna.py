@@ -55,7 +55,7 @@ def objective(trial, all_bags, train_ids, val_ids, device, epochs=35, model_type
     else:
         model = LigandCrossAttentionMIL(
             feature_dim=1280,
-            ecfp_dim=1024,
+            ecfp_dim=2048,
             hidden_dim=hidden_dim,
             num_heads=num_heads,
             num_classes=5,

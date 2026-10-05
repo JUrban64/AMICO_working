@@ -36,8 +36,15 @@ class AMICOPredictor:
                 if model_type == 'auto' and 'model' in cfg:
                     model_type = cfg['model']
 
+        # Check if checkpoint exists in direct path or in weights/ directory
+        if checkpoint_path and not os.path.exists(checkpoint_path):
+            candidate_weights = os.path.join("weights", checkpoint_path)
+            if os.path.exists(candidate_weights):
+                checkpoint_path = candidate_weights
+
         # Load weights and auto-detect architecture if requested
         loaded_state = None
+        ecfp_dim = 2048
         if checkpoint_path and os.path.exists(checkpoint_path):
             state = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
             if isinstance(state, dict):
@@ -56,6 +63,10 @@ class AMICOPredictor:
                 elif 'cross_attn.in_proj_weight' in loaded_state:
                     model_type = 'ligand_cross_mil'
 
+            # Auto-detect ECFP dimension from checkpoint if available
+            if 'ligand_proj.0.weight' in loaded_state:
+                ecfp_dim = loaded_state['ligand_proj.0.weight'].shape[1]
+
         # Initialize chosen architecture
         if model_type in ['self_attention_mil', 'self_att']:
             self.model_type = 'self_attention_mil'
@@ -70,7 +81,7 @@ class AMICOPredictor:
             self.model_type = 'ligand_cross_mil'
             self.model = LigandCrossAttentionMIL(
                 feature_dim=1280,
-                ecfp_dim=1024,
+                ecfp_dim=ecfp_dim,
                 hidden_dim=hidden_dim,
                 num_heads=num_heads,
                 num_classes=5,

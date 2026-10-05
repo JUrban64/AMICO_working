@@ -17,7 +17,7 @@ TARGET_NAMES = ['acetyl-CoA', 'ATP', 'B12', 'FAD', 'NAD']
 
 
 def generate_ecfp4_fingerprints(radius=2, n_bits=2048):
-    """Generates 1024-bit Morgan ECFP4 fingerprints for all 5 target cofactors."""
+    """Generates 2048-bit Morgan ECFP4 fingerprints for all 5 target cofactors."""
     fps = []
     try:
         from rdkit.Chem import rdFingerprintGenerator
@@ -51,7 +51,7 @@ class LigandCrossAttentionMIL(nn.Module):
     4. Transformer FFN + Residual LayerNorms.
     5. Linear Scorer: Output logits for each cofactor class.
     """
-    def __init__(self, feature_dim=1280, ecfp_dim=1024, hidden_dim=256, num_heads=4, num_classes=5, dropout=0.2):
+    def __init__(self, feature_dim=1280, ecfp_dim=2048, hidden_dim=256, num_heads=4, num_classes=5, dropout=0.2):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_classes = num_classes
