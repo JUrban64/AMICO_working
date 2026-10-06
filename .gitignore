@@ -54,3 +54,5 @@ benchmakrs
 benchmakrs/
 nise_benchmark.py
 nise_*
+
+*.pdb

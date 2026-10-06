@@ -226,47 +226,99 @@ def run_p2rank_batch(
 def get_full_sequence_from_pdb(pdb_path):
     """
     Extracts full amino acid sequence and residue metadata from a PDB file.
+    Works with Biopython when available, with a robust built-in pure-Python fallback.
     
     Returns:
         tuple: (seq_str, pdb_residues_dict, structure)
     """
-    parser = PDBParser(QUIET=True)
-    structure = parser.get_structure('protein', str(pdb_path))
-    
+    if PDBParser is not None:
+        try:
+            parser = PDBParser(QUIET=True)
+            structure = parser.get_structure('protein', str(pdb_path))
+            
+            sequence = []
+            pdb_residues = {}
+            residues_list = []
+            
+            for model in structure:
+                for chain in model:
+                    chain_id = chain.get_id().strip()
+                    for residue in chain:
+                        if is_aa(residue):
+                            resname = residue.get_resname().strip()
+                            resseq = str(residue.get_id()[1]).strip()
+                            one_letter = THREE_TO_ONE.get(resname, 'X')
+                            seq_idx = len(sequence)
+                            sequence.append(one_letter)
+                            r_info = {
+                                'residue': residue,
+                                'resname': resname,
+                                'one_letter': one_letter,
+                                'chain_id': chain_id,
+                                'resseq': resseq,
+                                'seq_idx': seq_idx
+                            }
+                            residues_list.append(r_info)
+                            pdb_residues[(chain_id, resseq)] = r_info
+                            if resseq not in pdb_residues:
+                                pdb_residues[resseq] = r_info
+                            if ('', resseq) not in pdb_residues:
+                                pdb_residues[('', resseq)] = r_info
+                            if ('A', resseq) not in pdb_residues:
+                                pdb_residues[('A', resseq)] = r_info
+
+            pdb_residues['_all_residues_list'] = residues_list
+            seq_str = ''.join(sequence)
+            return seq_str, pdb_residues, structure
+        except Exception:
+            pass
+
+    # Built-in pure-Python parser (used when Biopython is not installed)
     sequence = []
     pdb_residues = {}
     residues_list = []
-    
-    for model in structure:
-        for chain in model:
-            chain_id = chain.get_id().strip()
-            for residue in chain:
-                if is_aa(residue):
-                    resname = residue.get_resname().strip()
-                    resseq = str(residue.get_id()[1]).strip()
-                    one_letter = THREE_TO_ONE.get(resname, 'X')
-                    seq_idx = len(sequence)
-                    sequence.append(one_letter)
-                    r_info = {
-                        'residue': residue,
-                        'resname': resname,
-                        'one_letter': one_letter,
-                        'chain_id': chain_id,
-                        'resseq': resseq,
-                        'seq_idx': seq_idx
-                    }
-                    residues_list.append(r_info)
-                    pdb_residues[(chain_id, resseq)] = r_info
-                    if resseq not in pdb_residues:
-                        pdb_residues[resseq] = r_info
-                    if ('', resseq) not in pdb_residues:
-                        pdb_residues[('', resseq)] = r_info
-                    if ('A', resseq) not in pdb_residues:
-                        pdb_residues[('A', resseq)] = r_info
+    seen_residues = set()
+
+    with open(pdb_path, 'r', encoding='utf-8', errors='replace') as f:
+        for line in f:
+            if not line.startswith(('ATOM  ', 'HETATM')):
+                continue
+            resname = line[17:20].strip()
+            chain_id = line[21].strip()
+            resseq = line[22:26].strip()
+
+            if resname not in THREE_TO_ONE:
+                continue
+
+            res_key = (chain_id, resseq)
+            if res_key in seen_residues:
+                continue
+            seen_residues.add(res_key)
+
+            one_letter = THREE_TO_ONE[resname]
+            seq_idx = len(sequence)
+            sequence.append(one_letter)
+
+            r_info = {
+                'residue': None,
+                'resname': resname,
+                'one_letter': one_letter,
+                'chain_id': chain_id,
+                'resseq': resseq,
+                'seq_idx': seq_idx
+            }
+            residues_list.append(r_info)
+            pdb_residues[res_key] = r_info
+            if resseq not in pdb_residues:
+                pdb_residues[resseq] = r_info
+            if ('', resseq) not in pdb_residues:
+                pdb_residues[('', resseq)] = r_info
+            if ('A', resseq) not in pdb_residues:
+                pdb_residues[('A', resseq)] = r_info
 
     pdb_residues['_all_residues_list'] = residues_list
     seq_str = ''.join(sequence)
-    return seq_str, pdb_residues, structure
+    return seq_str, pdb_residues, None
 
 
 def parse_p2rank_output(prank_output_dir, pdb_path, min_prob=0.0):
@@ -425,18 +477,41 @@ def parse_p2rank_output(prank_output_dir, pdb_path, min_prob=0.0):
     # 4. Fallback: Check for physical *_pocket_*.pdb files if CSV parsing produced no pockets
     if not pockets_dict:
         pocket_pdbs = sorted(list(prank_dir.glob("*_pocket_*.pdb")))
-        parser = PDBParser(QUIET=True)
         for idx, p_pdb in enumerate(pocket_pdbs, start=1):
-            p_struct = parser.get_structure(f'pocket_{idx}', str(p_pdb))
             p_seq = []
             p_coords = []
-            for r in p_struct.get_residues():
-                if is_aa(r):
-                    resname = r.get_resname().strip()
-                    p_seq.append(THREE_TO_ONE.get(resname, 'X'))
-                    if 'CA' in r:
-                        p_coords.append(r['CA'].get_coord())
-            
+            seen_res = set()
+            if PDBParser is not None:
+                try:
+                    parser = PDBParser(QUIET=True)
+                    p_struct = parser.get_structure(f'pocket_{idx}', str(p_pdb))
+                    for r in p_struct.get_residues():
+                        if is_aa(r):
+                            resname = r.get_resname().strip()
+                            p_seq.append(THREE_TO_ONE.get(resname, 'X'))
+                            if 'CA' in r:
+                                p_coords.append(r['CA'].get_coord())
+                except Exception:
+                    p_seq = []
+                    p_coords = []
+
+            if not p_seq:
+                with open(p_pdb, 'r', encoding='utf-8', errors='replace') as f:
+                    for line in f:
+                        if line.startswith(('ATOM  ', 'HETATM')):
+                            resname = line[17:20].strip()
+                            chain_id = line[21].strip()
+                            resseq = line[22:26].strip()
+                            if resname in THREE_TO_ONE and (chain_id, resseq) not in seen_res:
+                                seen_res.add((chain_id, resseq))
+                                p_seq.append(THREE_TO_ONE[resname])
+                            atom_name = line[12:16].strip()
+                            if atom_name == 'CA':
+                                try:
+                                    p_coords.append([float(line[30:38]), float(line[38:46]), float(line[46:54])])
+                                except ValueError:
+                                    pass
+
             center = np.mean(p_coords, axis=0).tolist() if p_coords else [0.0, 0.0, 0.0]
             pockets_dict[idx] = {
                 'pocket_id': idx,

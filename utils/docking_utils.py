@@ -63,20 +63,42 @@ def get_pocket_center_from_pdb(protein_pdb, pocket_res_list=None):
     Calculates center of mass (center_x, center_y, center_z) of a pocket from a PDB file.
     If no residue list is provided, returns the center of mass of the whole protein.
     """
-    if PDBParser is None:
-        return np.array([0.0, 0.0, 0.0])
-
-    parser = PDBParser(QUIET=True)
-    structure = parser.get_structure('protein', protein_pdb)
     coords = []
+    if PDBParser is not None:
+        try:
+            parser = PDBParser(QUIET=True)
+            structure = parser.get_structure('protein', protein_pdb)
+            for model in structure:
+                for chain in model:
+                    for residue in chain:
+                        res_id = residue.get_id()[1]
+                        if pocket_res_list is None or res_id in pocket_res_list:
+                            for atom in residue:
+                                coords.append(atom.get_coord())
+            if len(coords) > 0:
+                return np.mean(coords, axis=0)
+        except Exception:
+            coords = []
 
-    for model in structure:
-        for chain in model:
-            for residue in chain:
-                res_id = residue.get_id()[1]
-                if pocket_res_list is None or res_id in pocket_res_list:
-                    for atom in residue:
-                        coords.append(atom.get_coord())
+    # Built-in pure-Python fallback
+    if os.path.exists(protein_pdb):
+        with open(protein_pdb, 'r', encoding='utf-8', errors='replace') as f:
+            for line in f:
+                if line.startswith(('ATOM  ', 'HETATM')):
+                    if pocket_res_list is not None:
+                        try:
+                            resseq = int(line[22:26].strip())
+                            if resseq not in pocket_res_list:
+                                continue
+                        except ValueError:
+                            continue
+                    try:
+                        x = float(line[30:38])
+                        y = float(line[38:46])
+                        z = float(line[46:54])
+                        coords.append([x, y, z])
+                    except ValueError:
+                        pass
 
     if len(coords) == 0:
         return np.array([0.0, 0.0, 0.0])

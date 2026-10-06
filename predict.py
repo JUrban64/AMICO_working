@@ -132,14 +132,18 @@ class AMICOPredictor:
         return self._esm_extractor
 
     def _enable_mc_dropout(self):
-        """Keep model in eval mode but activate Dropout layers for Monte Carlo sampling."""
+        """Keep model in eval mode, but activate Dropout and MultiheadAttention dropout."""
         self.model.eval()
         for m in self.model.modules():
-            if isinstance(m, torch.nn.Dropout):
+            # Activate standard Dropout layers
+            if isinstance(m, (torch.nn.Dropout, torch.nn.Dropout1d, torch.nn.Dropout2d)):
+                m.train()
+            # CRITICAL: Activate dropout inside PyTorch MultiheadAttention
+            elif isinstance(m, torch.nn.MultiheadAttention):
                 m.train()
 
     def predict(self, pocket_features, full_protein_feature, mc_samples=30, 
-                confidence_threshold=0.50, uncertainty_threshold=0.15):
+                confidence_threshold=0.40, uncertainty_threshold=0.10):
         """
         Runs model inference with optional Monte Carlo Dropout uncertainty estimation.
         
@@ -147,11 +151,11 @@ class AMICOPredictor:
             pocket_features: Tensor [N_pockets, 1280] or np.ndarray
             full_protein_feature: Tensor [1280] or np.ndarray
             mc_samples: Number of stochastic forward passes (1 = deterministic, >=20 for MC Dropout)
-            confidence_threshold: Minimum mean probability required to confirm cofactor binding
-            uncertainty_threshold: Maximum allowed standard deviation (variance) for confident prediction
+            confidence_threshold: Minimum mean probability required to confirm cofactor binding (default: 0.40)
+            uncertainty_threshold: Maximum allowed epistemic uncertainty (BALD Mutual Information) (default: 0.10)
 
         Returns:
-            dict containing prediction results, epistemic uncertainty, and non-binder detection
+            dict containing prediction results, epistemic uncertainty (BALD), and non-binder detection
         """
         if isinstance(pocket_features, np.ndarray):
             pocket_features = torch.FloatTensor(pocket_features)
@@ -194,25 +198,48 @@ class AMICOPredictor:
             all_probs = np.stack(all_probs, axis=0)  # [T, 5]
             all_attns = np.stack(all_attns, axis=0)  # [T, 5, N+1] or [T, N+1, N+1]
 
+            # 1. Predictive distribution
             mean_probs = np.mean(all_probs, axis=0)  # [5]
-            std_probs = np.std(all_probs, axis=0)    # [5] (Epistemic uncertainty)
-            mean_attn = np.mean(all_attns, axis=0)   # [5, N+1] or [N+1, N+1]
+            std_probs = np.std(all_probs, axis=0)    # [5]
+            mean_attn = np.mean(all_attns, axis=0)
+
+            # 2. Information-theoretic uncertainty decomposition
+            eps = 1e-12
+            # Total predictive entropy: H[p_bar]
+            total_entropy = -float(np.sum(mean_probs * np.log(mean_probs + eps)))
             
-            # Predictive entropy: H = - sum(p * log(p))
-            predictive_entropy = -float(np.sum(mean_probs * np.log(mean_probs + 1e-12)))
+            # Expected sample entropy: E[H[p_t]] (Aleatoric uncertainty)
+            sample_entropies = -np.sum(all_probs * np.log(all_probs + eps), axis=-1)  # [T]
+            aleatoric_entropy = float(np.mean(sample_entropies))
+            
+            # Mutual Information / BALD score: I(y, W | x) = H[p_bar] - E[H[p_t]] (Epistemic uncertainty)
+            epistemic_uncertainty = max(0.0, total_entropy - aleatoric_entropy)
 
             pred_idx = int(np.argmax(mean_probs))
             pred_label = TARGET_NAMES[pred_idx]
             confidence = float(mean_probs[pred_idx])
-            uncertainty = float(std_probs[pred_idx])
-            
-            # Non-binder / Out-of-Distribution protein detection
+
+            # 3. Reliability & non-binder evaluation
             if not has_pockets:
                 is_non_binder = True
                 binding_status = "NON_BINDER / NO_POCKETS"
+                rejection_reason = "No binding pockets detected above min_prob threshold"
             else:
-                is_non_binder = (confidence < confidence_threshold) or (uncertainty > uncertainty_threshold)
-                binding_status = "NON_BINDER / UNKNOWN_COFACTOR" if is_non_binder else "BINDER"
+                low_conf = (confidence < confidence_threshold)
+                high_unc = (epistemic_uncertainty > uncertainty_threshold)
+                is_non_binder = low_conf or high_unc
+                
+                if is_non_binder:
+                    binding_status = "NON_BINDER / UNKNOWN_COFACTOR"
+                    reasons = []
+                    if low_conf:
+                        reasons.append(f"Low confidence ({confidence*100:.1f}% < {confidence_threshold*100:.1f}%)")
+                    if high_unc:
+                        reasons.append(f"High epistemic uncertainty (BALD {epistemic_uncertainty:.3f} > {uncertainty_threshold:.3f})")
+                    rejection_reason = " & ".join(reasons)
+                else:
+                    binding_status = "BINDER"
+                    rejection_reason = None
 
             probs_dict = {
                 TARGET_NAMES[i]: {
@@ -234,15 +261,21 @@ class AMICOPredictor:
             pred_idx = int(np.argmax(probs))
             pred_label = TARGET_NAMES[pred_idx]
             confidence = float(probs[pred_idx])
-            uncertainty = 0.0
-            predictive_entropy = -float(np.sum(probs * np.log(probs + 1e-12)))
+            std_probs = np.zeros(len(TARGET_NAMES))
+            
+            eps = 1e-12
+            total_entropy = -float(np.sum(probs * np.log(probs + eps)))
+            aleatoric_entropy = total_entropy
+            epistemic_uncertainty = 0.0
 
             if not has_pockets:
                 is_non_binder = True
                 binding_status = "NON_BINDER / NO_POCKETS"
+                rejection_reason = "No binding pockets detected above min_prob threshold"
             else:
                 is_non_binder = confidence < confidence_threshold
                 binding_status = "NON_BINDER / UNKNOWN_COFACTOR" if is_non_binder else "BINDER"
+                rejection_reason = f"Low confidence ({confidence*100:.1f}% < {confidence_threshold*100:.0f}%)" if is_non_binder else None
 
             probs_dict = {
                 TARGET_NAMES[i]: {
@@ -288,9 +321,13 @@ class AMICOPredictor:
             "binding_status": binding_status,
             "has_pockets": has_pockets,
             "confidence": round(confidence, 4),
-            "uncertainty_std": round(uncertainty, 4),
-            "predictive_entropy": round(predictive_entropy, 4),
+            "uncertainty_std": round(float(std_probs[pred_idx]), 4),
+            "epistemic_uncertainty": round(epistemic_uncertainty, 4),
+            "mutual_information": round(epistemic_uncertainty, 4),
+            "predictive_entropy": round(total_entropy, 4),
+            "aleatoric_entropy": round(aleatoric_entropy, 4),
             "is_confident_prediction": not is_non_binder,
+            "rejection_reason": rejection_reason,
             "mc_samples_used": mc_samples,
             "probabilities": probs_dict,
             "best_binding_pocket": best_pocket_idx if not is_non_binder else None,
@@ -302,7 +339,7 @@ class AMICOPredictor:
 
     def predict_from_pdb(self, pdb_path, prank_exec=None, prank_out_dir=None, min_prob=None,
                          esm_model=None, mc_samples=30,
-                         confidence_threshold=0.50, uncertainty_threshold=0.15):
+                         confidence_threshold=0.40, uncertainty_threshold=0.10):
         """
         End-to-End prediction from a PDB structure:
           1. Execute P2Rank pocket prediction (or reuse cached output)
@@ -420,15 +457,15 @@ def main():
     parser.add_argument(
         '--model-type',
         type=str,
-        default='auto',
+        default='self_attention_mil',
         choices=['auto', 'ligand_cross_mil', 'self_attention_mil', 'self_att'],
         help='Model architecture type (auto, ligand_cross_mil, or self_attention_mil)'
     )
     parser.add_argument('--checkpoint', type=str, default=None, help='Path to model weights checkpoint')
     parser.add_argument('--config', type=str, default=None, help='Path to Optuna configuration JSON')
     parser.add_argument('--mc-samples', type=int, default=30, help='Number of MC Dropout stochastic samples (1 = deterministic, 30 = MC Dropout)')
-    parser.add_argument('--confidence-thresh', type=float, default=0.50, help='Minimum confidence threshold for binder classification')
-    parser.add_argument('--uncertainty-thresh', type=float, default=0.15, help='Maximum allowed uncertainty std dev for binder classification')
+    parser.add_argument('--confidence-thresh', type=float, default=0.40, help='Minimum confidence threshold for binder classification (default: 0.40)')
+    parser.add_argument('--uncertainty-thresh', type=float, default=0.10, help='Maximum allowed epistemic uncertainty / BALD Mutual Information (default: 0.10)')
 
     parser.add_argument('--dock', action='store_true', help='Automatically dock predicted cofactor into identified binding pocket')
     parser.add_argument('--force-dock', action='store_true', help='Force molecular docking even if classified as non-binder')
@@ -497,8 +534,10 @@ def main():
     print(f"Predicted Cofactor:      {res['predicted_cofactor']}")
     print(f"Mean Confidence:         {res['confidence'] * 100:.2f} %")
     if args.mc_samples > 1:
-        print(f"Uncertainty (MC std):    ±{res['uncertainty_std'] * 100:.2f} % (Samples: {res['mc_samples_used']})")
-        print(f"Predictive Entropy:      {res['predictive_entropy']:.4f}")
+        print(f"Epistemic Uncertainty:   {res['epistemic_uncertainty']:.4f} (BALD Mutual Information)")
+        print(f"Total Predictive Entropy:{res['predictive_entropy']:.4f}")
+        print(f"Aleatoric Entropy:       {res['aleatoric_entropy']:.4f}")
+        print(f"Top-Class MC std dev:    ±{res['uncertainty_std'] * 100:.2f} % (Samples: {res['mc_samples_used']})")
     
     if res['is_confident_prediction']:
         print(f"\nBinding Pocket Localization:")
@@ -514,7 +553,8 @@ def main():
             print("   AMICO was trained exclusively on proteins with >= 1 binding pocket.")
             print("   Evaluating protein as NON-BINDER (No Pockets / True Negative).")
         else:
-            print("\n⚠️ Model classified protein as NON-BINDER (True Negative) or prediction is below confidence threshold.")
+            reason_msg = f" ({res['rejection_reason']})" if res.get('rejection_reason') else ""
+            print(f"\n⚠️  [REJECTED AS NON-BINDER] Prediction deemed unreliable{reason_msg}.")
 
     print("\nCofactor Probabilities:")
     for name, p_data in res['probabilities'].items():
