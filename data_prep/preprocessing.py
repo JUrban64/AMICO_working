@@ -11,12 +11,8 @@ DEFAULT_ESM_MODEL = "facebook/esm2_t33_650M_UR50D"
 # Minimum P2Rank pocket probability kept as a MIL instance.
 DEFAULT_MIN_PROB = 0.30
 
-# How pocket embeddings are computed:
-#   'slice'  - one ESM pass over the full protein; each pocket = mean of its
-#              residues' per-residue embeddings (keeps sequence context).
-#   'concat' - legacy: pocket residues joined N->C into a pseudo-peptide and
-#              embedded on their own (no sequence context).
-POCKET_EMBEDDING_MODES = ("slice", "concat")
+# Pocket embeddings are computed by taking one ESM pass over the full protein
+# and mean-pooling per-residue embeddings over each pocket's residues ('slice').
 DEFAULT_POCKET_EMBEDDING = "slice"
 
 # How sequences longer than ESM-2's context (1022 residues) are handled:
@@ -27,26 +23,23 @@ DEFAULT_LONG_SEQUENCES = "chunk"
 
 CONFIG_KEYS = ("min_prob", "pocket_embedding", "long_sequences", "esm_model")
 
-# Settings used to build datasets/checkpoints before this config existed.
+# Settings used to build datasets/checkpoints.
 LEGACY_PREPROCESSING = {
     "min_prob": DEFAULT_MIN_PROB,
-    "pocket_embedding": "concat",
+    "pocket_embedding": "slice",
     "long_sequences": "truncate",
     "esm_model": DEFAULT_ESM_MODEL,
 }
 
 
 def make_preprocessing_config(min_prob=DEFAULT_MIN_PROB,
-                              pocket_embedding=DEFAULT_POCKET_EMBEDDING,
                               long_sequences=DEFAULT_LONG_SEQUENCES,
                               esm_model=DEFAULT_ESM_MODEL):
-    if pocket_embedding not in POCKET_EMBEDDING_MODES:
-        raise ValueError(f"pocket_embedding must be one of {POCKET_EMBEDDING_MODES}, got {pocket_embedding!r}")
     if long_sequences not in LONG_SEQUENCE_MODES:
         raise ValueError(f"long_sequences must be one of {LONG_SEQUENCE_MODES}, got {long_sequences!r}")
     return {
         "min_prob": float(min_prob),
-        "pocket_embedding": pocket_embedding,
+        "pocket_embedding": "slice",
         "long_sequences": long_sequences,
         "esm_model": esm_model,
     }
@@ -74,5 +67,5 @@ def config_from_records(records):
 
 
 def describe(cfg):
-    return (f"min_prob={cfg['min_prob']}, pocket_embedding={cfg['pocket_embedding']}, "
+    return (f"min_prob={cfg['min_prob']}, pocket_embedding={cfg.get('pocket_embedding', 'slice')}, "
             f"long_sequences={cfg['long_sequences']}, esm_model={cfg['esm_model']}")

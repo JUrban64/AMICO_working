@@ -7,9 +7,9 @@ import numpy as np
 
 from model_ligand_cross_att import LigandCrossAttentionMIL, TARGET_NAMES
 from model_self_attention import SelfAttentionMIL
-from p2rank_utils import run_p2rank, parse_p2rank_output, find_p2rank_executable
-from preprocessing import (
-    DEFAULT_ESM_MODEL, DEFAULT_MIN_PROB, DEFAULT_POCKET_EMBEDDING,
+from utils.p2rank_utils import run_p2rank, parse_p2rank_output, find_p2rank_executable
+from data_prep.preprocessing import (
+    DEFAULT_ESM_MODEL, DEFAULT_MIN_PROB,
     DEFAULT_LONG_SEQUENCES, LEGACY_PREPROCESSING, describe,
 )
 
@@ -85,7 +85,6 @@ class AMICOPredictor:
                 ecfp_dim = loaded_state['ligand_proj.0.weight'].shape[1]
 
         self.default_min_prob = self.preprocessing.get('min_prob', DEFAULT_MIN_PROB)
-        self.default_pocket_embedding = self.preprocessing.get('pocket_embedding', DEFAULT_POCKET_EMBEDDING)
         self.long_sequences = self.preprocessing.get('long_sequences', DEFAULT_LONG_SEQUENCES)
         self.default_esm_model = self.preprocessing.get('esm_model', DEFAULT_ESM_MODEL)
 
@@ -124,7 +123,7 @@ class AMICOPredictor:
         model_name = model_name or self.default_esm_model
         long_sequences = long_sequences or self.long_sequences
         if self._esm_extractor is None or getattr(self._esm_extractor, 'long_sequences', None) != long_sequences:
-            from esm_extractor import ESMFeatureExtractor
+            from utils.esm_extractor import ESMFeatureExtractor
             self._esm_extractor = ESMFeatureExtractor(
                 model_name=model_name,
                 device=self.device,
@@ -302,7 +301,7 @@ class AMICOPredictor:
         }
 
     def predict_from_pdb(self, pdb_path, prank_exec=None, prank_out_dir=None, min_prob=None,
-                         esm_model=None, pocket_embedding=None, mc_samples=30,
+                         esm_model=None, mc_samples=30,
                          confidence_threshold=0.50, uncertainty_threshold=0.15):
         """
         End-to-End prediction from a PDB structure:
@@ -320,8 +319,6 @@ class AMICOPredictor:
             min_prob = self.default_min_prob
         if esm_model is None:
             esm_model = self.default_esm_model
-        if pocket_embedding is None:
-            pocket_embedding = self.default_pocket_embedding
 
         # 1. P2Rank
         if prank_out_dir and Path(prank_out_dir).exists():
@@ -342,8 +339,8 @@ class AMICOPredictor:
 
         # 3. ESM-2 extraction
         extractor = self._get_esm_extractor(model_name=esm_model)
-        print(f"-> Generating ESM-2 embeddings (pocket embedding: {pocket_embedding})...")
-        feats = extractor.extract_features(parsed_data, pocket_embedding=pocket_embedding)
+        print("-> Generating ESM-2 embeddings...")
+        feats = extractor.extract_features(parsed_data)
         pocket_features = feats['pocket_features']
         full_protein_feature = feats['full_protein_feature']
 
@@ -418,7 +415,6 @@ def main():
     parser.add_argument('--prank', type=str, default=None, help='Path to P2Rank prank binary (default: auto-detected)')
     parser.add_argument('--p2rank-dir', type=str, default=None, help='Path to existing P2Rank output directory')
     parser.add_argument('--min-prob', type=float, default=None, help='Minimum P2Rank pocket probability threshold (default: from checkpoint or 0.30)')
-    parser.add_argument('--pocket-embedding', type=str, default=None, choices=['slice', 'concat'], help='Pocket embedding strategy: slice (default, from full-protein ESM pass) or concat (legacy)')
     parser.add_argument('--esm-model', type=str, default='facebook/esm2_t33_650M_UR50D', help='HuggingFace ESM-2 model identifier')
 
     parser.add_argument(
@@ -473,7 +469,6 @@ def main():
             prank_out_dir=args.p2rank_dir,
             min_prob=args.min_prob,
             esm_model=args.esm_model,
-            pocket_embedding=args.pocket_embedding,
             mc_samples=args.mc_samples,
             confidence_threshold=args.confidence_thresh,
             uncertainty_threshold=args.uncertainty_thresh
@@ -543,7 +538,7 @@ def main():
         if not res['is_confident_prediction'] and not args.force_dock:
             print("\n[DOCKING SKIPPED] Docking skipped: protein evaluated as non-binder (use --force-dock to override).")
         else:
-            from docking_utils import dock_predicted_cofactor
+            from utils.docking_utils import dock_predicted_cofactor
 
             pred_cofactor = res['raw_top_class']
             pdb_path = args.pdb if args.pdb else "sample_protein.pdb"
@@ -561,7 +556,7 @@ def main():
                 center = np.array(res['best_pocket_center'])
                 docking_site_label = f"attention focus Pocket #{res.get('best_binding_pocket', 1)}"
             else:
-                from docking_utils import get_pocket_center_from_pdb
+                from utils.docking_utils import get_pocket_center_from_pdb
                 center = get_pocket_center_from_pdb(pdb_path) if os.path.exists(pdb_path) else np.array([0.0, 0.0, 0.0])
                 docking_site_label = "protein center of mass fallback"
 

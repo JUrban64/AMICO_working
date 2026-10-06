@@ -4,7 +4,10 @@ import argparse
 import torch
 import numpy as np
 from tqdm import tqdm
-from Bio.PDB import PDBParser
+try:
+    from Bio.PDB import PDBParser
+except ImportError:
+    PDBParser = None
 import glob
 import sys
 
@@ -13,7 +16,7 @@ root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if root_dir not in sys.path:
     sys.path.insert(0, root_dir)
 
-from esm_extractor import ESMFeatureExtractor
+from utils.esm_extractor import ESMFeatureExtractor
 
 
 def is_aa(residue):
@@ -21,6 +24,8 @@ def is_aa(residue):
 
 
 def get_full_sequence_from_pdb(pdb_path):
+    if PDBParser is None:
+        raise ImportError("Biopython is required to parse PDB files. Install via 'pip install biopython'.")
     parser = PDBParser(QUIET=True)
     try:
         structure = parser.get_structure('protein', pdb_path)

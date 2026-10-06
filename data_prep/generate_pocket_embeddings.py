@@ -12,10 +12,10 @@ root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if root_dir not in sys.path:
     sys.path.insert(0, root_dir)
 
-from p2rank_utils import parse_p2rank_output
-from esm_extractor import ESMFeatureExtractor
-from preprocessing import (
-    DEFAULT_ESM_MODEL, DEFAULT_MIN_PROB, DEFAULT_POCKET_EMBEDDING, POCKET_EMBEDDING_MODES,
+from utils.p2rank_utils import parse_p2rank_output
+from utils.esm_extractor import ESMFeatureExtractor
+from data_prep.preprocessing import (
+    DEFAULT_ESM_MODEL, DEFAULT_MIN_PROB,
     make_preprocessing_config, config_from_records, describe,
 )
 
@@ -78,8 +78,6 @@ def main():
     parser.add_argument('--metadata', type=str, default=default_metadata, help='Path to dataset_metadata.tsv')
     parser.add_argument('--out-path', type=str, default=default_out, help='Output file path for esm_dataset.pt')
     parser.add_argument('--min-prob', type=float, default=DEFAULT_MIN_PROB, help=f'Minimum P2Rank pocket probability threshold (default: {DEFAULT_MIN_PROB})')
-    parser.add_argument('--pocket-embedding', type=str, default=DEFAULT_POCKET_EMBEDDING, choices=POCKET_EMBEDDING_MODES,
-                        help="'slice' = pool pocket residues from the full-protein ESM pass (default); 'concat' = legacy residue-string embedding")
     parser.add_argument('--esm-model', type=str, default=DEFAULT_ESM_MODEL, help='HuggingFace ESM-2 model identifier')
     parser.add_argument('--device', type=str, default=None, help='Compute device for ESM (cuda, mps, cpu)')
     parser.add_argument('--save-interval', type=int, default=100, help='Checkpoint saving interval')
@@ -90,7 +88,6 @@ def main():
 
     prep_cfg = make_preprocessing_config(
         min_prob=args.min_prob,
-        pocket_embedding=args.pocket_embedding,
         long_sequences='chunk',
         esm_model=args.esm_model,
     )
@@ -190,7 +187,7 @@ def main():
 
         try:
             parsed = parse_p2rank_output(args.prank_dir, pdb_path, min_prob=args.min_prob)
-            feats = extractor.extract_features(parsed, pocket_embedding=args.pocket_embedding)
+            feats = extractor.extract_features(parsed)
             if not feats['pockets']:
                 no_pocket_count += 1
 

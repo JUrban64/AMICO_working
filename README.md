@@ -192,7 +192,7 @@ if result.get('best_p2rank_pocket_center'):
 ### Architecture Details:
 - **LigandCrossAttentionMIL (`model_ligand_cross_att.py`)**: Uses Morgan ECFP4 chemical fingerprints of target cofactors as queries that cross-attend over structural pocket representations and the global protein context vector.
 - **SelfAttentionMIL (`model_self_attention.py`)**: Self-attention pooling mechanism across pocket instances and full-protein context without chemical queries.
-- **AutoDock Vina Docking (`docking_utils.py`)**: Automatically computes 3D cofactor conformers via RDKit and docks into the center of mass of the top P2Rank pocket.
+- **AutoDock Vina Docking (`utils/docking_utils.py`)**: Automatically computes 3D cofactor conformers via RDKit and docks into the center of mass of the top P2Rank pocket.
 
 ---
 
@@ -211,14 +211,17 @@ AMICO/
 ├── dataset.py                           # Dataset loader & collator for MIL bags
 ├── train_ligand_cross_att.py            # Trainer for LigandCrossAttentionMIL
 ├── train_self_attention.py              # Trainer for SelfAttentionMIL
-│
-├── predict.py                           # End-to-end inference CLI & API
-├── p2rank_utils.py                      # P2Rank execution & output parsing
-├── esm_extractor.py                     # ESM-2 feature extractor
-├── docking_utils.py                     # AutoDock Vina preparation & docking
 ├── tune_optuna.py                       # Hyperparameter optimization (Optuna)
 │
+├── predict.py                           # End-to-end inference CLI & API
+│
+├── utils/
+│   ├── p2rank_utils.py                  # P2Rank execution & output parsing
+│   ├── esm_extractor.py                 # ESM-2 feature extractor
+│   └── docking_utils.py                 # AutoDock Vina preparation & docking
+│
 └── data_prep/
+    ├── preprocessing.py                 # Feature extraction & preprocessing config
     ├── alphafoldDB_APi.py               # AlphaFold DB downloading & metadata curation
     ├── structure_clustering.py          # Foldseek clustering & cluster-split generation
     ├── build_esm_dataset.py             # Batch P2Rank + ESM-2 extraction pipeline

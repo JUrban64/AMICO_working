@@ -2,9 +2,14 @@ import os
 import csv
 import glob
 import shutil
+import sys
 from pathlib import Path
 import numpy as np
 import torch
+
+root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if root_dir not in sys.path:
+    sys.path.insert(0, root_dir)
 
 try:
     from Bio.PDB import PDBParser, PDBIO, Select

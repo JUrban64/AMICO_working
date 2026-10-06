@@ -14,7 +14,7 @@ class SelfAttentionMIL(nn.Module):
     4. Transformer FFN + Residual LayerNorms.
     5. Classification Head: Projects updated CLS token to cofactor logits.
     """
-    def __init__(self, feature_dim=1280, hidden_dim=256, num_heads=4, num_classes=5, dropout=0.2):
+    def __init__(self, feature_dim=1280, hidden_dim=512, num_heads=2, num_classes=5, dropout=0.25):
         super().__init__()
         self.feature_dim = feature_dim
         self.hidden_dim = hidden_dim

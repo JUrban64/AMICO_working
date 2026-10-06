@@ -5,7 +5,7 @@ from torch.nn.utils.rnn import pad_sequence
 import numpy as np
 from collections import defaultdict
 
-from preprocessing import config_from_records, describe
+from data_prep.preprocessing import config_from_records, describe
 
 TARGET_NAMES = ['acetyl-CoA', 'ATP', 'B12', 'FAD', 'NAD']
 
