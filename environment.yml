@@ -1,0 +1,21 @@
+name: amico
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python>=3.10
+  - foldseek
+  - rdkit>=2022.03.1
+  - biopython>=1.79
+  - numpy>=1.22.0
+  - scipy>=1.8.0
+  - scikit-learn>=1.0.0
+  - pandas>=1.4.0
+  - tqdm>=4.64.0
+  - requests>=2.28.0
+  - optuna>=3.0.0
+  - pip
+  - pip:
+      - torch>=2.0.0
+      - transformers>=4.20.0

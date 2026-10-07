@@ -6,16 +6,26 @@ AMICO predicts enzyme cofactor binding specificity (`ATP`, `NAD`, `FAD`, `B12`, 
 
 ## ⚙️ Installation
 
+### Option A: Via Conda / Mamba (Recommended, includes Foldseek)
+```bash
+git clone https://github.com/JUrban64/AMICO.git
+cd AMICO
+conda env create -f environment.yml
+conda activate amico
+```
+
+### Option B: Via pip
 ```bash
 git clone https://github.com/JUrban64/AMICO.git
 cd AMICO
 pip install -r requirements.txt
+conda install -c conda-forge -c bioconda foldseek
 ```
 
 *Requirements:* Python ≥ 3.10, PyTorch ≥ 2.0.
-*Optional external tools:*
+*External tools:*
+- [Foldseek](https://github.com/steineggerlab/foldseek) (included in `environment.yml`; required for structural clustering and Foldseek benchmarks).
 - [P2Rank](https://github.com/rdkit/p2rank) (bundled in `p2rank_2.5.1/`, requires Java JRE/JDK ≥ 11 for pocket prediction from raw PDBs).
-- [Foldseek](https://github.com/steineggerlab/foldseek) (required in `PATH` for structural clustering and Foldseek benchmarks: `conda install -c conda-forge -c bioconda foldseek`).
 - [AutoDock Vina](https://vina.scripps.edu/) (optional for downstream docking: `pip install vina` or system binary).
 
 ---
@@ -192,6 +202,7 @@ if result.get('best_p2rank_pocket_center'):
 ### Architecture Details:
 - **LigandCrossAttentionMIL (`model_ligand_cross_att.py`)**: Uses Morgan ECFP4 chemical fingerprints of target cofactors as queries that cross-attend over structural pocket representations and the global protein context vector.
 - **SelfAttentionMIL (`model_self_attention.py`)**: Self-attention pooling mechanism across pocket instances and full-protein context without chemical queries.
+- **Monte Carlo Dropout**: Epistemic uncertainty estimation and rejection thresholds can be further optimized and calibrated on validation data (e.g., via BALD mutual information or temperature scaling).
 - **AutoDock Vina Docking (`utils/docking_utils.py`)**: Automatically computes 3D cofactor conformers via RDKit and docks into the center of mass of the top P2Rank pocket.
 
 ---

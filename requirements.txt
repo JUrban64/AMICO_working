@@ -24,3 +24,4 @@ optuna>=3.0.0
 
 # External Tools / Binary Dependencies (via Conda):
 # Structural Clustering & Benchmark (Foldseek):
+# conda install -c conda-forge -c bioconda foldseek
