@@ -527,51 +527,48 @@ def main():
         prot_id = "sample_protein_demo"
 
     # Display results
-    print("\n" + "=" * 65)
-    print(f"            AMICO INFERENCE RESULTS: {prot_id}")
-    print("=" * 65)
-    print(f"Binding Status:          {res['binding_status']}")
-    print(f"Predicted Cofactor:      {res['predicted_cofactor']}")
-    print(f"Mean Confidence:         {res['confidence'] * 100:.2f} %")
+    print("\n" + "=" * 58)
+    print(f" AMICO INFERENCE: {prot_id}")
+    print("=" * 58)
+    print(f"Status:      {res['binding_status']}")
+    print(f"Cofactor:    {res['predicted_cofactor']} ({res['confidence'] * 100:.1f}%)")
     if args.mc_samples > 1:
-        print(f"Epistemic Uncertainty:   {res['epistemic_uncertainty']:.4f} (BALD Mutual Information)")
-        print(f"Total Predictive Entropy:{res['predictive_entropy']:.4f}")
-        print(f"Aleatoric Entropy:       {res['aleatoric_entropy']:.4f}")
-        print(f"Top-Class MC std dev:    ±{res['uncertainty_std'] * 100:.2f} % (Samples: {res['mc_samples_used']})")
+        print(f"Uncertainty: BALD = {res['epistemic_uncertainty']:.4f} | MC std = ±{res['uncertainty_std'] * 100:.2f}% (Entropy: {res['predictive_entropy']:.2f})")
     
-    if res['is_confident_prediction']:
-        print(f"\nBinding Pocket Localization:")
-        if res.get('best_p2rank_pocket_id') is not None:
-            cx, cy, cz = res['best_p2rank_pocket_center']
-            print(f" -> Top P2Rank Pocket (Docking Site): Pocket #{res['best_p2rank_pocket_id']} ({res['best_p2rank_pocket_name']}) | Score: {res['best_p2rank_score']:.2f}, Prob: {res['best_p2rank_prob']:.2f}")
-            print(f"    3D Coordinates:                  [x={cx:.2f}, y={cy:.2f}, z={cz:.2f}]")
-        print(f" -> Model Attention Focus:           Pocket #{res['best_binding_pocket']} (Attention: {res['best_pocket_attention']:.4f})")
-        print(f" -> Global Enzyme Influence:         {res['global_context_weight']:.4f}")
-    else:
+    if not res['is_confident_prediction']:
         if not res.get('has_pockets', True):
-            print("\n⚠️  [OUT OF DISTRIBUTION] Protein has 0 pockets detected above the probability threshold.")
-            print("   AMICO was trained exclusively on proteins with >= 1 binding pocket.")
-            print("   Evaluating protein as NON-BINDER (No Pockets / True Negative).")
+            print("\n⚠️  [NON-BINDER] 0 pockets detected above threshold.")
         else:
-            reason_msg = f" ({res['rejection_reason']})" if res.get('rejection_reason') else ""
-            print(f"\n⚠️  [REJECTED AS NON-BINDER] Prediction deemed unreliable{reason_msg}.")
+            reason_msg = f": {res['rejection_reason']}" if res.get('rejection_reason') else ""
+            print(f"\n⚠️  [REJECTED AS NON-BINDER]{reason_msg}")
 
-    print("\nCofactor Probabilities:")
-    for name, p_data in res['probabilities'].items():
-        if args.mc_samples > 1:
+    # Sorted cofactor probabilities
+    print("\nCofactor Probabilities (sorted):")
+    sorted_probs = sorted(
+        res['probabilities'].items(),
+        key=lambda x: x[1].get('mean_probability', x[1].get('probability', 0.0)),
+        reverse=True
+    )
+    for name, p_data in sorted_probs:
+        if args.mc_samples > 1 and 'uncertainty_std' in p_data:
             mean_p = p_data['mean_probability'] * 100
             std_p = p_data['uncertainty_std'] * 100
-            print(f" - {name:<12}: {mean_p:6.2f} %  (±{std_p:4.2f} %)")
+            print(f"  • {name:<12}: {mean_p:5.1f} %  (±{std_p:4.1f} %)")
         else:
-            p = p_data['probability'] * 100
-            print(f" - {name:<12}: {p:6.2f} %")
+            p = p_data.get('probability', p_data.get('mean_probability', 0.0)) * 100
+            print(f"  • {name:<12}: {p:5.1f} %")
 
-    print("\nPocket Compatibility Rankings:")
-    for p_info in res['pocket_rankings']:
-        p_str = f" - Pocket #{p_info['pocket_id']:<2}: Attention = {p_info['attention_score']:.4f}"
-        if 'p2rank_prob' in p_info:
-            p_str += f" | P2Rank Prob: {p_info['p2rank_prob']:.2f} | Residues: {p_info['residue_count']}"
-        print(p_str)
+    # Binding Site & Pockets
+    if res['is_confident_prediction'] and res.get('best_p2rank_pocket_id') is not None:
+        cx, cy, cz = res['best_p2rank_pocket_center']
+        print("\nBinding Site:")
+        print(f"  • Docking Site: Pocket #{res['best_p2rank_pocket_id']} ({res['best_p2rank_pocket_name']}) at [{cx:.1f}, {cy:.1f}, {cz:.1f}] | P2Rank Score: {res['best_p2rank_score']:.1f} (Prob: {res['best_p2rank_prob']:.2f})")
+        print(f"  • Attention:    Pocket #{res['best_binding_pocket']} (weight: {res['best_pocket_attention']:.3f}) | Global context: {res['global_context_weight']:.3f}")
+        
+        if len(res['pocket_rankings']) > 1:
+            p_strs = [f"Pocket #{p['pocket_id']} ({p['attention_score']:.2f})" for p in res['pocket_rankings'][:3]]
+            print(f"  • Top Pockets:  {', '.join(p_strs)}")
+    print("=" * 58)
 
     # Molecular docking if requested (into best P2Rank pocket)
     if args.dock or args.force_dock:
