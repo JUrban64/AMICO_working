@@ -61,11 +61,12 @@ def train_self_attention(
     hidden_dim=256,
     num_heads=4,
     patience=12,
-    split_suffix='mil_0.5',
+    split_suffix='mil_0.5_nr0.9',
     pockets_path='data_prep/esm_dataset.pt',
     full_proteins_path='data_prep/esm_full_proteins.pt',
     save_model='self_attention_mil_best.pt',
-    config_json=None
+    config_json=None,
+    min_prob=0.0
 ):
     if config_json and os.path.exists(config_json):
         print(f"Loading configuration from {config_json}...")
@@ -80,16 +81,18 @@ def train_self_attention(
         batch_size = cfg.get('batch_size', batch_size)
         if 'split_suffix' in cfg:
             split_suffix = cfg['split_suffix']
+        if 'min_prob' in cfg:
+            min_prob = cfg['min_prob']
 
     device = torch.device('cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'))
     print(f"Using compute device: {device}")
-    print(f"SelfAttentionMIL Hyperparameters: lr={lr:.2e}, weight_decay={weight_decay:.2e}, dropout={dropout}, label_smoothing={label_smoothing}, hidden_dim={hidden_dim}, heads={num_heads}, batch_size={batch_size}")
+    print(f"SelfAttentionMIL Hyperparameters: lr={lr:.2e}, weight_decay={weight_decay:.2e}, dropout={dropout}, label_smoothing={label_smoothing}, hidden_dim={hidden_dim}, heads={num_heads}, batch_size={batch_size}, min_prob={min_prob}")
 
     base_dir = PROJECT_ROOT
     pockets_full = os.path.join(base_dir, pockets_path) if not os.path.isabs(pockets_path) else pockets_path
     full_prot_full = os.path.join(base_dir, full_proteins_path) if not os.path.isabs(full_proteins_path) else full_proteins_path
 
-    all_bags, prep_cfg = load_cross_mil_data(pockets_full, full_prot_full, mode='pockets', return_config=True)
+    all_bags, prep_cfg = load_cross_mil_data(pockets_full, full_prot_full, mode='pockets', min_prob=min_prob, return_config=True)
     train_ids, val_ids, test_ids = load_split_ids(base_dir, split_suffix=split_suffix)
 
     train_bags, val_bags, test_bags = [], [], []
@@ -175,8 +178,10 @@ def train_self_attention(
                 'model_type': 'self_attention_mil',
                 'hparams': {'hidden_dim': hidden_dim, 'num_heads': num_heads, 'dropout': dropout},
                 'preprocessing': prep_cfg,
+                'min_prob': min_prob,
+                'split_suffix': split_suffix,
             }, save_model)
-            save_msg = "(Model saved)"
+            save_msg = "🔥 (Model saved)"
         else:
             save_msg = ""
 
@@ -220,6 +225,7 @@ def main():
     parser.add_argument('--num-heads', type=int, default=2)
     parser.add_argument('--patience', type=int, default=12)
     parser.add_argument('--split-suffix', type=str, default='mil_0.5_nr0.9')
+    parser.add_argument('--min-prob', type=float, default=0.0, help='Filter pockets by min P2Rank probability (e.g. 0.30 to match residue models)')
     parser.add_argument('--pockets-path', default='data_prep/esm_dataset.pt')
     parser.add_argument('--full-proteins-path', default='data_prep/esm_full_proteins.pt')
     parser.add_argument('--save-model', type=str, default='self_attention_mil_best.pt', help='Output checkpoint file path')
@@ -239,7 +245,8 @@ def main():
         pockets_path=args.pockets_path,
         full_proteins_path=args.full_proteins_path,
         save_model=args.save_model,
-        config_json=args.config_json
+        config_json=args.config_json,
+        min_prob=args.min_prob
     )
 
 

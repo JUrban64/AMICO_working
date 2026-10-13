@@ -122,7 +122,8 @@ def main():
     parser.add_argument('--model', type=str, default='ligand_cross_mil', choices=['ligand_cross_mil', 'self_attention_mil', 'self_att'], help='Target model architecture')
     parser.add_argument('--n-trials', type=int, default=50, help='Total number of Optuna trials')
     parser.add_argument('--epochs', type=int, default=35, help='Training epochs per trial')
-    parser.add_argument('--split-suffix', type=str, default='mil_0.5', help='Dataset split suffix')
+    parser.add_argument('--split-suffix', type=str, default='mil_0.5_nr0.9', help='Dataset split suffix')
+    parser.add_argument('--min-prob', type=float, default=0.0, help='Filter pockets by min P2Rank probability (e.g. 0.30)')
     parser.add_argument('--pockets-path', default='data_prep/esm_dataset.pt', help='Path to pocket embeddings dataset')
     parser.add_argument('--full-proteins-path', default='data_prep/esm_full_proteins.pt', help='Path to full protein embeddings')
     args = parser.parse_args()
@@ -140,7 +141,7 @@ def main():
     pockets_path = os.path.join(base_dir, args.pockets_path) if not os.path.isabs(args.pockets_path) else args.pockets_path
     full_proteins_path = os.path.join(base_dir, args.full_proteins_path) if not os.path.isabs(args.full_proteins_path) else args.full_proteins_path
 
-    all_bags = load_cross_mil_data(pockets_path, full_proteins_path, mode='pockets')
+    all_bags = load_cross_mil_data(pockets_path, full_proteins_path, mode='pockets', min_prob=args.min_prob)
     train_ids, val_ids, _ = load_split_ids(base_dir, split_suffix=args.split_suffix)
 
     clean_sfx = args.split_suffix.replace('/', '_').replace('.', '_')
@@ -166,6 +167,7 @@ def main():
                 "best_trial_number": study.best_trial.number,
                 "best_val_macro_f1": study.best_value,
                 "split_suffix": args.split_suffix,
+                "min_prob": args.min_prob,
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 **study.best_params
             }

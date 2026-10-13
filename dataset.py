@@ -118,11 +118,12 @@ def match_id(pid, id_set):
     return base in id_set
 
 
-def load_cross_mil_data(pockets_path, full_proteins_path, mode='pockets'):
+def load_cross_mil_data(pockets_path, full_proteins_path, mode='pockets', min_prob=0.0, max_pockets=None, return_config=False):
     """
     Loads ESM pocket embeddings and ESM whole-protein embeddings, pairing them into MIL bags.
+    Supports filtering pockets by minimum probability threshold (min_prob) and capping max pockets per protein.
     """
-    print(f"Loading pocket features from {pockets_path}...")
+    print(f"Loading pocket features from {pockets_path} (min_prob={min_prob})...")
     raw_pockets = torch.load(pockets_path, weights_only=False)
     
     print(f"Loading full protein features from {full_proteins_path}...")
@@ -131,8 +132,23 @@ def load_cross_mil_data(pockets_path, full_proteins_path, mode='pockets'):
     bags_dict = defaultdict(list)
     labels_dict = {}
     missing_full_prot = 0
+    filtered_prob_count = 0
+    prep_cfg = None
     
     for item in raw_pockets:
+        if prep_cfg is None and 'preprocessing' in item:
+            prep_cfg = item['preprocessing']
+
+        # Filter by minimum pocket probability threshold (e.g. min_prob=0.30)
+        prob = item.get('probability', item.get('prob', None))
+        if prob is not None and min_prob > 0.0:
+            try:
+                if float(prob) < float(min_prob):
+                    filtered_prob_count += 1
+                    continue
+            except (ValueError, TypeError):
+                pass
+
         raw_pid = item['protein_id']
         base_name = os.path.basename(raw_pid)
         pid = base_name.split('_pocket_')[0].replace('.pdb', '').replace('_prank_output', '')
@@ -150,6 +166,10 @@ def load_cross_mil_data(pockets_path, full_proteins_path, mode='pockets'):
         label = item['label']
         labels_dict[pid] = label
         
+        # Limit max pockets per protein if specified
+        if max_pockets is not None and pid in bags_dict and len(bags_dict[pid]) >= max_pockets:
+            continue
+
         if mode == 'pockets':
             if feat.ndim > 1:
                 feat = feat.mean(dim=0)
@@ -157,15 +177,19 @@ def load_cross_mil_data(pockets_path, full_proteins_path, mode='pockets'):
         else:
             bags_dict[pid].append(feat.cpu().numpy() if torch.is_tensor(feat) else np.array(feat))
             
+    if filtered_prob_count > 0:
+        print(f"-> Filtered out {filtered_prob_count} pockets with probability < {min_prob}.")
     if missing_full_prot > 0:
         print(f"Warning: Missing full protein embedding for {missing_full_prot} pockets.")
         
     bag_list = []
-    for pid in bags_dict:
+    for pid, p_list in bags_dict.items():
+        if not p_list:
+            continue
         if mode == 'pockets':
-            pocket_features = torch.FloatTensor(np.stack(bags_dict[pid]))
+            pocket_features = torch.FloatTensor(np.stack(p_list))
         else:
-            pocket_features = torch.FloatTensor(np.concatenate(bags_dict[pid], axis=0))
+            pocket_features = torch.FloatTensor(np.concatenate(p_list, axis=0))
             
         full_protein_feat = full_proteins.get(pid, full_proteins.get(pid.split('_')[0]))
         if isinstance(full_protein_feat, np.ndarray):
@@ -180,8 +204,13 @@ def load_cross_mil_data(pockets_path, full_proteins_path, mode='pockets'):
             'label': torch.LongTensor([labels_dict[pid]])
         })
         
-    print(f"Successfully loaded {len(bag_list)} paired protein bags.")
+    print(f"Successfully loaded {len(bag_list)} paired protein bags (min_prob={min_prob}).")
     
+    if return_config:
+        if prep_cfg is not None and isinstance(prep_cfg, dict) and min_prob > 0.0:
+            prep_cfg = dict(prep_cfg)
+            prep_cfg['min_prob'] = min_prob
+        return bag_list, prep_cfg
     return bag_list
 
 

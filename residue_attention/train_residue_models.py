@@ -89,11 +89,11 @@ def train_residue_model(
     val_dataset=None,
     test_dataset=None,
     epochs=50,
-    lr=5e-5,
-    weight_decay=1e-5,
-    dropout=0.2,
-    label_smoothing=0.15,
-    batch_size=32,
+    lr=4.86e-5,
+    weight_decay=1.07e-5,
+    dropout=0.15,
+    label_smoothing=0.20,
+    batch_size=64,
     hidden_dim=256,
     num_heads=4,
     use_3d_bias=True,
@@ -135,9 +135,16 @@ def train_residue_model(
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=residue_collate_fn) if val_dataset else None
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=residue_collate_fn) if test_dataset else None
 
+    # Compute balanced class weights to prevent minority class collapse
+    train_labels = [item['label'].item() if torch.is_tensor(item['label']) else int(item['label']) for item in train_dataset]
+    class_counts = np.bincount(train_labels, minlength=5)
+    class_weights = torch.FloatTensor(len(train_labels) / (5.0 * np.maximum(class_counts, 1))).to(device)
+    print(f"-> Class distribution (Train): {class_counts.tolist()}")
+    print(f"-> Balanced Class Weights: {class_weights.cpu().numpy().round(3).tolist()}")
+
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6)
-    criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
     early_stopper = EarlyStopping(patience=patience)
 
     best_val_loss = float('inf')
@@ -249,11 +256,11 @@ def main():
     parser.add_argument('--config-json', type=str, default=None,
                         help="Path to hyperparameters JSON configuration file")
     parser.add_argument('--epochs', type=int, default=50, help="Number of training epochs")
-    parser.add_argument('--batch-size', type=int, default=32, help="Batch size")
-    parser.add_argument('--lr', type=float, default=5e-5, help="Learning rate")
-    parser.add_argument('--weight-decay', type=float, default=1e-5, help="Weight decay for AdamW")
-    parser.add_argument('--dropout', type=float, default=0.2, help="Dropout probability")
-    parser.add_argument('--label-smoothing', type=float, default=0.15, help="Label smoothing")
+    parser.add_argument('--batch-size', type=int, default=64, help="Batch size")
+    parser.add_argument('--lr', type=float, default=4.86e-5, help="Learning rate")
+    parser.add_argument('--weight-decay', type=float, default=1.07e-5, help="Weight decay for AdamW")
+    parser.add_argument('--dropout', type=float, default=0.15, help="Dropout probability")
+    parser.add_argument('--label-smoothing', type=float, default=0.20, help="Label smoothing")
     parser.add_argument('--hidden-dim', type=int, default=256, help="Hidden projection dimension")
     parser.add_argument('--num-heads', type=int, default=4, help="Number of attention heads")
     parser.add_argument('--no-3d-bias', action='store_true', help="Disable 3D pairwise distance attention bias")
