@@ -17,6 +17,7 @@ if root_dir not in sys.path:
 from residue_attention.model_residue_self_attention import ResidueSelfAttentionMIL
 from residue_attention.model_residue_ligand_cross_att import ResidueLigandCrossAttentionMIL
 from residue_attention.dataset_residues import ResidueDataset, residue_collate_fn, TARGET_NAMES
+from dataset import load_split_ids, match_id
 
 try:
     from sklearn.metrics import accuracy_score, f1_score, classification_report
@@ -182,6 +183,9 @@ def train_residue_model(
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 best_epoch = epoch
+                save_dir = os.path.dirname(os.path.abspath(save_path))
+                if save_dir:
+                    os.makedirs(save_dir, exist_ok=True)
                 torch.save({
                     'epoch': epoch,
                     'model_state_dict': model.state_dict(),
@@ -203,7 +207,7 @@ def train_residue_model(
 
     if val_loader and os.path.exists(save_path):
         print(f"\nLoading best checkpoint from {save_path}...")
-        ckpt = torch.load(save_path, map_location=device)
+        ckpt = torch.load(save_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt['model_state_dict'])
 
     if test_loader:
@@ -215,3 +219,178 @@ def train_residue_model(
         print("=" * 60)
 
     return model
+
+
+def generate_synthetic_dataset(num_samples=120, min_m=25, max_m=50, feature_dim=1280):
+    """Generates synthetic residue data for pipeline smoke-testing."""
+    data = []
+    for i in range(num_samples):
+        m = np.random.randint(min_m, max_m + 1)
+        data.append({
+            'protein_id': f'SYNTH_{i:04d}',
+            'residue_features': torch.randn(m, feature_dim),
+            'residue_coords': torch.rand(m, 3) * 30.0,
+            'full_protein_feature': torch.randn(feature_dim),
+            'label': torch.tensor(np.random.randint(0, 5), dtype=torch.long),
+            'residue_metadata': [{'resseq': str(j + 1), 'resname': 'ALA', 'chain': 'A'} for j in range(m)]
+        })
+    return data
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Train AMICO Residue-Level Attention Models")
+    parser.add_argument('--model-type', type=str, default='residue_ligand_cross',
+                        choices=['residue_ligand_cross', 'residue_self_attention'],
+                        help="Model architecture: 'residue_ligand_cross' or 'residue_self_attention'")
+    parser.add_argument('--dataset-path', type=str, default=None,
+                        help="Path to precomputed residue dataset (.pt)")
+    parser.add_argument('--synthetic-demo', action='store_true',
+                        help="Run smoke-test training on generated synthetic residue data")
+    parser.add_argument('--config-json', type=str, default=None,
+                        help="Path to hyperparameters JSON configuration file")
+    parser.add_argument('--epochs', type=int, default=50, help="Number of training epochs")
+    parser.add_argument('--batch-size', type=int, default=32, help="Batch size")
+    parser.add_argument('--lr', type=float, default=5e-5, help="Learning rate")
+    parser.add_argument('--weight-decay', type=float, default=1e-5, help="Weight decay for AdamW")
+    parser.add_argument('--dropout', type=float, default=0.2, help="Dropout probability")
+    parser.add_argument('--label-smoothing', type=float, default=0.15, help="Label smoothing")
+    parser.add_argument('--hidden-dim', type=int, default=256, help="Hidden projection dimension")
+    parser.add_argument('--num-heads', type=int, default=4, help="Number of attention heads")
+    parser.add_argument('--no-3d-bias', action='store_true', help="Disable 3D pairwise distance attention bias")
+    parser.add_argument('--bias-3d-mode', type=str, default='rbf_gaussian',
+                        choices=['rbf_gaussian', 'linear_decay'],
+                        help="3D geometric bias kernel mode")
+    parser.add_argument('--patience', type=int, default=12, help="Early stopping patience")
+    parser.add_argument('--save-path', type=str, default='residue_model_best.pt',
+                        help="Path to save best checkpoint")
+    parser.add_argument('--split-suffix', type=str, default=None,
+                        help="Structural clustering split suffix (e.g. 'mil_0.5_nr0.9' or 'mil0.5_nr0.9')")
+
+    args = parser.parse_args()
+
+    # Load JSON config if provided
+    if args.config_json and os.path.exists(args.config_json):
+        print(f"Loading configuration from {args.config_json}...")
+        with open(args.config_json, 'r') as f:
+            cfg = json.load(f)
+        args.hidden_dim = cfg.get('hidden_dim', args.hidden_dim)
+        args.num_heads = cfg.get('num_heads', args.num_heads)
+        args.lr = cfg.get('lr', args.lr)
+        args.weight_decay = cfg.get('weight_decay', args.weight_decay)
+        args.dropout = cfg.get('dropout', args.dropout)
+        args.label_smoothing = cfg.get('label_smoothing', args.label_smoothing)
+        args.batch_size = cfg.get('batch_size', args.batch_size)
+        if 'model_type' in cfg:
+            args.model_type = cfg['model_type']
+        if 'split_suffix' in cfg and not args.split_suffix:
+            args.split_suffix = cfg['split_suffix']
+
+    use_3d_bias = not args.no_3d_bias
+
+    # Load or generate dataset
+    train_dataset, val_dataset, test_dataset = None, None, None
+
+    if args.dataset_path and os.path.exists(args.dataset_path):
+        print(f"Loading residue dataset from {args.dataset_path}...")
+        raw_data = torch.load(args.dataset_path, map_location='cpu', weights_only=False)
+
+        # Unpack items from file
+        all_items = []
+        if isinstance(raw_data, dict):
+            if 'all' in raw_data and len(raw_data['all']) > 0:
+                all_items = raw_data['all']
+            elif 'train' in raw_data:
+                all_items = list(raw_data['train']) + list(raw_data.get('val', [])) + list(raw_data.get('test', []))
+            else:
+                for v in raw_data.values():
+                    if isinstance(v, list):
+                        all_items.extend(v)
+        elif isinstance(raw_data, list):
+            all_items = raw_data
+        else:
+            raise ValueError(f"Unrecognized format in dataset file {args.dataset_path}")
+
+        print(f"-> Total samples in dataset: {len(all_items)}")
+
+        # Check if pre-existing splits in raw_data are valid and not overridden
+        has_valid_splits = (
+            isinstance(raw_data, dict)
+            and 'train' in raw_data and len(raw_data['train']) > 0
+            and 'val' in raw_data and len(raw_data['val']) > 0
+            and not args.split_suffix
+        )
+
+        if has_valid_splits:
+            print(f"-> Using pre-partitioned splits from dataset: Train={len(raw_data['train'])}, Val={len(raw_data.get('val', []))}, Test={len(raw_data.get('test', []))}")
+            train_dataset = ResidueDataset(raw_data['train'])
+            val_dataset = ResidueDataset(raw_data['val']) if 'val' in raw_data and len(raw_data['val']) > 0 else None
+            test_dataset = ResidueDataset(raw_data['test']) if 'test' in raw_data and len(raw_data['test']) > 0 else None
+        else:
+            # Need to partition using split files
+            split_suffix = args.split_suffix or 'mil_0.5_nr0.9'
+            print(f"-> Partitioning dataset using split suffix '{split_suffix}'...")
+            train_ids, val_ids, test_ids = load_split_ids(root_dir, split_suffix=split_suffix)
+
+            if len(train_ids) > 0 and (len(val_ids) > 0 or len(test_ids) > 0):
+                train_items, val_items, test_items, unassigned = [], [], [], []
+                for item in all_items:
+                    pid = item['protein_id']
+                    if match_id(pid, train_ids):
+                        train_items.append(item)
+                    elif match_id(pid, val_ids):
+                        val_items.append(item)
+                    elif match_id(pid, test_ids):
+                        test_items.append(item)
+                    else:
+                        unassigned.append(item)
+
+                print(f"   Split breakdown ({split_suffix}) -> Train: {len(train_items)}, Val: {len(val_items)}, Test: {len(test_items)}")
+                if unassigned:
+                    print(f"   Note: {len(unassigned)} proteins were not in split lists (unassigned).")
+
+                if len(val_items) == 0:
+                    print(f"⚠️ Warning: Validation set has 0 samples for suffix '{split_suffix}'!")
+
+                train_dataset = ResidueDataset(train_items)
+                val_dataset = ResidueDataset(val_items) if len(val_items) > 0 else None
+                test_dataset = ResidueDataset(test_items) if len(test_items) > 0 else None
+            else:
+                print("⚠️ No valid split files matched. Falling back to 80/10/10 split.")
+                n_total = len(all_items)
+                n_train = int(0.8 * n_total)
+                n_val = int(0.1 * n_total)
+                train_dataset = ResidueDataset(all_items[:n_train])
+                val_dataset = ResidueDataset(all_items[n_train:n_train + n_val])
+                test_dataset = ResidueDataset(all_items[n_train + n_val:])
+    elif args.synthetic_demo or not args.dataset_path:
+        if not args.dataset_path:
+            print("No --dataset-path provided. Running demonstration with synthetic dataset...")
+        synth_data = generate_synthetic_dataset(num_samples=90)
+        train_dataset = ResidueDataset(synth_data[:60])
+        val_dataset = ResidueDataset(synth_data[60:75])
+        test_dataset = ResidueDataset(synth_data[75:])
+        if args.epochs == 50 and not args.dataset_path:
+            args.epochs = 5  # Quick demonstration default
+
+    train_residue_model(
+        model_type=args.model_type,
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+        test_dataset=test_dataset,
+        epochs=args.epochs,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        dropout=args.dropout,
+        label_smoothing=args.label_smoothing,
+        batch_size=args.batch_size,
+        hidden_dim=args.hidden_dim,
+        num_heads=args.num_heads,
+        use_3d_bias=use_3d_bias,
+        bias_3d_mode=args.bias_3d_mode,
+        patience=args.patience,
+        save_path=args.save_path
+    )
+
+
+if __name__ == '__main__':
+    main()

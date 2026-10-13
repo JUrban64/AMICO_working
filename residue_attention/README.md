@@ -116,8 +116,81 @@ spectrum b, blue_white_red, all
 
 ---
 
-## 🚀 Running Verification & Demo
+## 🚀 How to Run (`residue_attention`)
 
+### 1. Verification & End-to-End Demo (Unit Tests + Real Structure)
+Runs component checks, forward/backward passes with 3D distance bias, P2Rank extraction on `AF-Q9NRG4-F1-model_v6.pdb`, and generates PyMOL `.pml` and B-factor `.pdb`:
 ```bash
 python residue_attention/demo_and_test.py
+```
+
+### 2. Generating the Residue Dataset (`build_residue_dataset.py`)
+Processes structures through P2Rank and ESM-2, saving per-residue embeddings, 3D $C_\alpha$ coordinates, whole-protein context embeddings, and metadata into `data_prep/residues_dataset.pt`:
+
+#### A. From a folder of PDB structures:
+```bash
+python residue_attention/build_residue_dataset.py \
+    --pdb-dir structures/all_pdbs \
+    --metadata structures/dataset_metadata.tsv \
+    --prank-out-dir structures/p2rank_outputs \
+    --output-path data_prep/residues_dataset.pt \
+    --min-prob 0.10 \
+    --max-pockets 5
+```
+
+#### B. Quick test on a single PDB (reusing existing P2Rank outputs):
+```bash
+python residue_attention/build_residue_dataset.py \
+    --single-pdb AF-Q9NRG4-F1-model_v6.pdb \
+    --skip-p2rank \
+    --prank-out-dir temp_p2rank \
+    --output-path data_prep/test_single_residue_dataset.pt
+```
+
+#### C. Fast Re-partitioning existing dataset (e.g. after extraction):
+```bash
+python residue_attention/build_residue_dataset.py \
+    --resplit-only \
+    --output-path data_prep/residues_dataset.pt \
+    --split-suffix mil_0.5_nr0.9
+```
+
+### 3. Training Models (`train_residue_models.py`)
+
+#### A. Full Dataset Training (with auto-partitioning via `--split-suffix`):
+```bash
+python residue_attention/train_residue_models.py \
+    --model-type residue_ligand_cross \
+    --dataset-path data_prep/residues_dataset.pt \
+    --split-suffix mil_0.5_nr0.9 \
+    --epochs 50 \
+    --batch-size 32 \
+    --lr 5e-5 \
+    --bias-3d-mode rbf_gaussian \
+    --save-path weights/residue_ligand_cross_best.pt
+```
+
+#### B. Smoke-test Training (Synthetic Data):
+```bash
+python residue_attention/train_residue_models.py --synthetic-demo --epochs 5
+```
+
+#### Available CLI Options:
+* `--model-type`: `residue_ligand_cross` (default) or `residue_self_attention`
+* `--dataset-path`: Path to `.pt` residue dataset file
+* `--split-suffix`: Clustering split suffix (e.g. `mil_0.5_nr0.9` or `mil0.5_nr0.9`)
+* `--synthetic-demo`: Runs quick smoke-test on synthetic data
+* `--bias-3d-mode`: `rbf_gaussian` (default) or `linear_decay`
+* `--no-3d-bias`: Disable 3D geometric attention bias
+* `--epochs`, `--batch-size`, `--lr`, `--weight-decay`, `--dropout`, `--hidden-dim`, `--num-heads`, `--patience`, `--save-path`
+
+### 4. PyMOL 3D Key Residue Visualization
+Inspect the highlighted catalytic / binding residues:
+```bash
+pymol residue_attention/demo_visualization.pml
+```
+Or view the continuous attention B-factor heatmap:
+```python
+load residue_attention/demo_annotated.pdb
+spectrum b, blue_white_red, all
 ```

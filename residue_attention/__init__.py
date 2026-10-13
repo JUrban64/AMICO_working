@@ -34,6 +34,8 @@ from residue_attention.interpretability import (
     write_pdb_with_attention_bfactor
 )
 
+from residue_attention.build_residue_dataset import build_residue_dataset
+
 __all__ = [
     'Pairwise3DDistanceBias',
     'ResidueSelfAttentionMIL',
@@ -48,6 +50,7 @@ __all__ = [
     'format_key_residues_summary',
     'export_pymol_script',
     'write_pdb_with_attention_bfactor',
+    'build_residue_dataset',
     'TARGET_NAMES',
     'COFACTORS',
     'generate_ecfp4_fingerprints'

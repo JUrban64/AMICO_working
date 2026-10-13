@@ -20,30 +20,30 @@ set label_outline_color, black
 set label_shadow_mode, 2
 
 # Highlight Key Residues Identified by AMICO Attention
-select key_ASN_380, chain A and resi 380
-show sticks, key_ASN_380
-color brightorange, key_ASN_380 and name C*
-label key_ASN_380 and name CA, "ASN380 (2.3%)"
-select key_ALA_40, chain A and resi 40
-show sticks, key_ALA_40
-color brightorange, key_ALA_40 and name C*
-label key_ALA_40 and name CA, "ALA40 (2.1%)"
-select key_SER_239, chain A and resi 239
-show sticks, key_SER_239
-color brightorange, key_SER_239 and name C*
-label key_SER_239 and name CA, "SER239 (2.1%)"
-select key_PRO_124, chain A and resi 124
-show sticks, key_PRO_124
-color brightorange, key_PRO_124 and name C*
-label key_PRO_124 and name CA, "PRO124 (2.0%)"
-select key_ILE_118, chain A and resi 118
-show sticks, key_ILE_118
-color brightorange, key_ILE_118 and name C*
-label key_ILE_118 and name CA, "ILE118 (2.0%)"
+select key_TYR_217, chain A and resi 217
+show sticks, key_TYR_217
+color brightorange, key_TYR_217 and name C*
+label key_TYR_217 and name CA, "TYR217 (2.3%)"
+select key_ILE_241, chain A and resi 241
+show sticks, key_ILE_241
+color brightorange, key_ILE_241 and name C*
+label key_ILE_241 and name CA, "ILE241 (2.1%)"
+select key_MET_85, chain A and resi 85
+show sticks, key_MET_85
+color brightorange, key_MET_85 and name C*
+label key_MET_85 and name CA, "MET85 (2.1%)"
+select key_ALA_203, chain A and resi 203
+show sticks, key_ALA_203
+color brightorange, key_ALA_203 and name C*
+label key_ALA_203 and name CA, "ALA203 (2.1%)"
+select key_PRO_37, chain A and resi 37
+show sticks, key_PRO_37
+color brightorange, key_PRO_37 and name C*
+label key_PRO_37 and name CA, "PRO37 (2.1%)"
 
 
 # Center on key binding site residues
-select all_key_residues, key_ASN_380 + key_ALA_40 + key_SER_239 + key_PRO_124 + key_ILE_118
+select all_key_residues, key_TYR_217 + key_ILE_241 + key_MET_85 + key_ALA_203 + key_PRO_37
 zoom all_key_residues, 6.0
 orient all_key_residues
 

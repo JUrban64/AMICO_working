@@ -7,50 +7,106 @@ from collections import defaultdict
 
 TARGET_NAMES = ['acetyl-CoA', 'ATP', 'B12', 'FAD', 'NAD']
 
+import re
+import glob
+
+
+def normalize_split_tag(s):
+    if not s:
+        return ''
+    s = os.path.basename(s)
+    s = re.sub(r'^(train|validation|val|test)[_-]?', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'\.txt$', '', s, flags=re.IGNORECASE)
+    return re.sub(r'[^a-zA-Z0-9]', '', s).lower()
+
+
 def load_split_ids(base_dir, split_suffix='_mil_0.5', use_nr=False):
-    """Loads protein identifiers for train/val/test splits based on the specified split suffix."""
+    """
+    Loads protein identifiers for train/val/test splits based on the specified split suffix.
+    Supports exact matching as well as normalized fuzzy matching (e.g. 'mil0.5_nr0.9' matches 'mil_0.5_nr0.9').
+    """
+    search_dirs = [
+        os.path.join(base_dir, 'data_prep'),
+        base_dir,
+        os.path.abspath('data_prep'),
+        os.path.abspath('.')
+    ]
+    unique_dirs = []
+    for d in search_dirs:
+        if d and os.path.exists(d) and d not in unique_dirs:
+            unique_dirs.append(d)
+
+    # 1. Try direct exact match with prefix '_'
+    exact_candidates = [split_suffix]
     if not split_suffix.startswith('_'):
-        split_suffix = f'_{split_suffix}'
+        exact_candidates.append(f'_{split_suffix}')
+    else:
+        exact_candidates.append(split_suffix.lstrip('_'))
 
-    if use_nr and '_nr' not in split_suffix:
-        nr_candidates = [
-            f"{split_suffix}_nr0.95",
-            f"{split_suffix}_nr0.9",
-            f"{split_suffix}_nr"
-        ]
-        found = False
-        for cand in nr_candidates:
-            if os.path.exists(os.path.join(base_dir, f'data_prep/train{cand}.txt')) or os.path.exists(os.path.join(base_dir, f'train{cand}.txt')):
-                split_suffix = cand
-                found = True
-                break
-        if not found:
-            dp_dir = os.path.join(base_dir, 'data_prep')
-            if os.path.exists(dp_dir):
-                for f in os.listdir(dp_dir):
-                    if f.startswith(f'train{split_suffix}_nr') and f.endswith('.txt'):
-                        split_suffix = f.replace('train', '').replace('.txt', '')
-                        found = True
+    train_path, val_path, test_path = None, None, None
+
+    for cand_suf in exact_candidates:
+        for d in unique_dirs:
+            cand_t = os.path.join(d, f'train{cand_suf}.txt')
+            if not os.path.exists(cand_t):
+                cand_t = os.path.join(d, f'train_{cand_suf}.txt')
+            if os.path.exists(cand_t):
+                train_path = cand_t
+                actual_suffix = os.path.basename(cand_t)[len('train'):].replace('.txt', '')
+                for v_name in [f'validation{actual_suffix}.txt', f'val{actual_suffix}.txt']:
+                    if os.path.exists(os.path.join(d, v_name)):
+                        val_path = os.path.join(d, v_name)
                         break
-        if not found:
-            split_suffix = f"{split_suffix}_nr"
+                cand_test = os.path.join(d, f'test{actual_suffix}.txt')
+                if os.path.exists(cand_test):
+                    test_path = cand_test
+                break
+        if train_path:
+            break
 
-    train_path = os.path.join(base_dir, f'data_prep/train{split_suffix}.txt')
-    val_path = os.path.join(base_dir, f'data_prep/validation{split_suffix}.txt')
-    test_path = os.path.join(base_dir, f'data_prep/test{split_suffix}.txt')
-
-    if not os.path.exists(train_path):
-        train_path = os.path.join(base_dir, f'train{split_suffix}.txt')
-        val_path = os.path.join(base_dir, f'validation{split_suffix}.txt')
-        test_path = os.path.join(base_dir, f'test{split_suffix}.txt')
+    # 2. If not found, use normalized matching across all existing train*.txt files
+    if not train_path:
+        norm_query = normalize_split_tag(split_suffix)
+        for d in unique_dirs:
+            train_files = glob.glob(os.path.join(d, 'train*.txt'))
+            for tf in train_files:
+                norm_file = normalize_split_tag(tf)
+                if norm_file == norm_query or norm_query in norm_file or norm_file in norm_query:
+                    train_path = tf
+                    suffix_from_file = os.path.basename(tf)[len('train'):].replace('.txt', '')
+                    for v_name in [f'validation{suffix_from_file}.txt', f'val{suffix_from_file}.txt']:
+                        if os.path.exists(os.path.join(d, v_name)):
+                            val_path = os.path.join(d, v_name)
+                            break
+                    cand_test = os.path.join(d, f'test{suffix_from_file}.txt')
+                    if os.path.exists(cand_test):
+                        test_path = cand_test
+                    break
+            if train_path:
+                break
 
     def read_ids(path):
-        if not os.path.exists(path):
+        if not path or not os.path.exists(path):
             return set()
-        with open(path, 'r') as f:
+        with open(path, 'r', encoding='utf-8') as f:
             return set(line.strip() for line in f if line.strip())
 
-    return read_ids(train_path), read_ids(val_path), read_ids(test_path)
+    train_ids = read_ids(train_path)
+    val_ids = read_ids(val_path)
+    test_ids = read_ids(test_path)
+
+    if len(train_ids) == 0:
+        available_files = []
+        for d in unique_dirs:
+            available_files.extend(os.path.basename(f) for f in glob.glob(os.path.join(d, 'train*.txt')))
+        print(f"⚠️ Warning: Could not find split files for '{split_suffix}'. Available train files: {available_files}")
+    else:
+        print(f"-> Found split files for '{split_suffix}':")
+        print(f"   Train: {train_path} ({len(train_ids)} IDs)")
+        print(f"   Val:   {val_path} ({len(val_ids)} IDs)")
+        print(f"   Test:  {test_path} ({len(test_ids)} IDs)")
+
+    return train_ids, val_ids, test_ids
 
 
 def match_id(pid, id_set):
