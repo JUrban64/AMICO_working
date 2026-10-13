@@ -118,10 +118,27 @@ def match_id(pid, id_set):
     return base in id_set
 
 
-def load_cross_mil_data(pockets_path, full_proteins_path, mode='pockets', min_prob=0.0, max_pockets=None, return_config=False):
+import csv
+from pathlib import Path
+
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def load_cross_mil_data(
+    pockets_path,
+    full_proteins_path,
+    mode='pockets',
+    min_prob=0.0,
+    max_pockets=None,
+    filter_dataset_path=None,
+    prank_dir=None,
+    return_config=False
+):
     """
     Loads ESM pocket embeddings and ESM whole-protein embeddings, pairing them into MIL bags.
     Supports filtering pockets by minimum probability threshold (min_prob) and capping max pockets per protein.
+    If pocket records lack the 'probability' metadata field (legacy format), automatically resolves
+    valid proteins/pockets using reference 'residues_dataset.pt' or P2Rank prediction CSV files.
     """
     print(f"Loading pocket features from {pockets_path} (min_prob={min_prob})...")
     raw_pockets = torch.load(pockets_path, weights_only=False)
@@ -134,12 +151,94 @@ def load_cross_mil_data(pockets_path, full_proteins_path, mode='pockets', min_pr
     missing_full_prot = 0
     filtered_prob_count = 0
     prep_cfg = None
-    
+
+    # Check whether raw_pockets records contain explicit probability metadata
+    has_prob_field = any(('probability' in item or 'prob' in item) for item in raw_pockets[:100])
+    valid_protein_pockets = None
+    prank_cache = None
+
+    if min_prob > 0.0 and not has_prob_field:
+        print(f"⚠️  Notice: Records in '{pockets_path}' do not contain 'probability' metadata (legacy format).")
+        # 1. First candidate: reference residues_dataset.pt built with min_prob threshold
+        res_candidates = []
+        if filter_dataset_path:
+            res_candidates.append(filter_dataset_path)
+        pockets_dir = os.path.dirname(os.path.abspath(pockets_path))
+        res_candidates.extend([
+            os.path.join(pockets_dir, 'residues_dataset.pt'),
+            os.path.join(PROJECT_ROOT, 'data_prep', 'residues_dataset.pt'),
+            os.path.abspath('data_prep/residues_dataset.pt')
+        ])
+
+        found_res_path = None
+        for cand in res_candidates:
+            if cand and os.path.exists(cand):
+                found_res_path = cand
+                break
+
+        if found_res_path:
+            print(f"-> Loading reference min_prob >= {min_prob} proteins and pockets from {found_res_path}...")
+            res_data = torch.load(found_res_path, map_location='cpu', weights_only=False)
+            all_res_items = []
+            if isinstance(res_data, dict):
+                if 'all' in res_data and len(res_data['all']) > 0:
+                    all_res_items = res_data['all']
+                elif 'train' in res_data:
+                    all_res_items = list(res_data['train']) + list(res_data.get('val', [])) + list(res_data.get('test', []))
+                else:
+                    for v in res_data.values():
+                        if isinstance(v, list):
+                            all_res_items.extend(v)
+            elif isinstance(res_data, list):
+                all_res_items = res_data
+
+            valid_protein_pockets = defaultdict(set)
+            for r_item in all_res_items:
+                p_id = r_item.get('protein_id', '').replace('.pdb', '')
+                clean_p = p_id.split('_')[0]
+                p_ids = set()
+                for r_meta in r_item.get('residue_metadata', []):
+                    for p in r_meta.get('pockets', []):
+                        try:
+                            p_ids.add(int(p))
+                        except (ValueError, TypeError):
+                            pass
+                valid_protein_pockets[p_id].update(p_ids)
+                valid_protein_pockets[clean_p].update(p_ids)
+            print(f"-> Found {len(valid_protein_pockets)} reference protein entries meeting min_prob >= {min_prob}.")
+        else:
+            # 2. Second candidate: P2Rank output directory containing *_predictions.csv
+            p_dir_candidates = [
+                prank_dir,
+                os.path.join(PROJECT_ROOT, 'structures', 'p2rank_outputs'),
+                os.path.abspath('structures/p2rank_outputs')
+            ]
+            found_prank_dir = None
+            for pd in p_dir_candidates:
+                if pd and os.path.exists(pd):
+                    found_prank_dir = pd
+                    break
+            if found_prank_dir:
+                print(f"-> Resolving pocket probabilities on-demand from P2Rank outputs in {found_prank_dir}...")
+                prank_cache = {'dir': Path(found_prank_dir), 'probs': {}}
+            else:
+                print(f"⚠️  Warning: Cannot filter legacy dataset '{pockets_path}' by min_prob={min_prob} without reference 'residues_dataset.pt' or 'structures/p2rank_outputs'. All pockets will be kept.")
+
     for item in raw_pockets:
         if prep_cfg is None and 'preprocessing' in item:
             prep_cfg = item['preprocessing']
 
-        # Filter by minimum pocket probability threshold (e.g. min_prob=0.30)
+        raw_pid = item['protein_id']
+        base_name = os.path.basename(raw_pid)
+        pid = base_name.split('_pocket_')[0].replace('.pdb', '').replace('_prank_output', '')
+        clean_pid = pid.split('_')[0]
+
+        pocket_id = None
+        m = re.search(r'_pocket_(\d+)', base_name)
+        if m:
+            pocket_id = int(m.group(1))
+
+        # Check 1: Direct probability in item
         prob = item.get('probability', item.get('prob', None))
         if prob is not None and min_prob > 0.0:
             try:
@@ -148,14 +247,51 @@ def load_cross_mil_data(pockets_path, full_proteins_path, mode='pockets', min_pr
                     continue
             except (ValueError, TypeError):
                 pass
+        # Check 2: Reference residue dataset filtering (exact match with residue models)
+        elif valid_protein_pockets is not None:
+            if pid not in valid_protein_pockets and clean_pid not in valid_protein_pockets:
+                filtered_prob_count += 1
+                continue
+            allowed_pockets = valid_protein_pockets.get(pid, valid_protein_pockets.get(clean_pid))
+            if allowed_pockets and pocket_id is not None and pocket_id not in allowed_pockets:
+                filtered_prob_count += 1
+                continue
+        # Check 3: On-demand lookup in P2Rank outputs CSV files
+        elif prank_cache is not None and min_prob > 0.0:
+            p_dir = prank_cache['dir']
+            if pid not in prank_cache['probs']:
+                pocket_probs = {}
+                pred_file = p_dir / f"{pid}_predictions.csv"
+                if not pred_file.exists():
+                    pred_file = p_dir / f"{pid}.pdb_predictions.csv"
+                if not pred_file.exists():
+                    cands = list(p_dir.glob(f"{pid}*_predictions.csv"))
+                    pred_file = cands[0] if cands else None
+                if pred_file and pred_file.exists():
+                    try:
+                        with open(pred_file, 'r', encoding='utf-8') as f:
+                            r = csv.DictReader(f, skipinitialspace=True)
+                            for row in r:
+                                clean_row = {k.strip(): v.strip() for k, v in row.items() if k}
+                                prob_val = float(clean_row.get('probability', clean_row.get('prob', 0.0)))
+                                name_val = clean_row.get('name', '')
+                                rank_val = int(clean_row.get('rank', 1))
+                                match_id = re.search(r'(\d+)', name_val)
+                                curr_id = int(match_id.group(1)) if match_id else rank_val
+                                pocket_probs[curr_id] = prob_val
+                    except Exception:
+                        pass
+                prank_cache['probs'][pid] = pocket_probs
+            p_prob = prank_cache['probs'][pid].get(pocket_id, None)
+            if p_prob is not None and p_prob < min_prob:
+                filtered_prob_count += 1
+                continue
+            elif p_prob is None and len(prank_cache['probs'][pid]) > 0:
+                filtered_prob_count += 1
+                continue
 
-        raw_pid = item['protein_id']
-        base_name = os.path.basename(raw_pid)
-        pid = base_name.split('_pocket_')[0].replace('.pdb', '').replace('_prank_output', '')
-        
         # Verify presence of full protein embedding (supporting fragments like _F1)
         if pid not in full_proteins:
-            clean_pid = pid.split('_')[0]
             if clean_pid in full_proteins:
                 full_proteins[pid] = full_proteins[clean_pid]
             else:
@@ -178,7 +314,7 @@ def load_cross_mil_data(pockets_path, full_proteins_path, mode='pockets', min_pr
             bags_dict[pid].append(feat.cpu().numpy() if torch.is_tensor(feat) else np.array(feat))
             
     if filtered_prob_count > 0:
-        print(f"-> Filtered out {filtered_prob_count} pockets with probability < {min_prob}.")
+        print(f"-> Filtered out {filtered_prob_count} pockets/instances with probability < {min_prob}.")
     if missing_full_prot > 0:
         print(f"Warning: Missing full protein embedding for {missing_full_prot} pockets.")
         

@@ -64,6 +64,8 @@ def train_self_attention(
     split_suffix='mil_0.5_nr0.9',
     pockets_path='data_prep/esm_dataset.pt',
     full_proteins_path='data_prep/esm_full_proteins.pt',
+    filter_dataset_path='data_prep/residues_dataset.pt',
+    prank_dir='structures/p2rank_outputs',
     save_model='self_attention_mil_best.pt',
     config_json=None,
     min_prob=0.0
@@ -91,8 +93,18 @@ def train_self_attention(
     base_dir = PROJECT_ROOT
     pockets_full = os.path.join(base_dir, pockets_path) if not os.path.isabs(pockets_path) else pockets_path
     full_prot_full = os.path.join(base_dir, full_proteins_path) if not os.path.isabs(full_proteins_path) else full_proteins_path
+    filter_data_full = os.path.join(base_dir, filter_dataset_path) if filter_dataset_path and not os.path.isabs(filter_dataset_path) else filter_dataset_path
+    prank_dir_full = os.path.join(base_dir, prank_dir) if prank_dir and not os.path.isabs(prank_dir) else prank_dir
 
-    all_bags, prep_cfg = load_cross_mil_data(pockets_full, full_prot_full, mode='pockets', min_prob=min_prob, return_config=True)
+    all_bags, prep_cfg = load_cross_mil_data(
+        pockets_full,
+        full_prot_full,
+        mode='pockets',
+        min_prob=min_prob,
+        filter_dataset_path=filter_data_full,
+        prank_dir=prank_dir_full,
+        return_config=True
+    )
     train_ids, val_ids, test_ids = load_split_ids(base_dir, split_suffix=split_suffix)
 
     train_bags, val_bags, test_bags = [], [], []
@@ -226,6 +238,8 @@ def main():
     parser.add_argument('--patience', type=int, default=12)
     parser.add_argument('--split-suffix', type=str, default='mil_0.5_nr0.9')
     parser.add_argument('--min-prob', type=float, default=0.0, help='Filter pockets by min P2Rank probability (e.g. 0.30 to match residue models)')
+    parser.add_argument('--filter-dataset', type=str, default='data_prep/residues_dataset.pt', help='Reference dataset with min_prob threshold')
+    parser.add_argument('--prank-dir', type=str, default='structures/p2rank_outputs', help='Directory with P2Rank outputs')
     parser.add_argument('--pockets-path', default='data_prep/esm_dataset.pt')
     parser.add_argument('--full-proteins-path', default='data_prep/esm_full_proteins.pt')
     parser.add_argument('--save-model', type=str, default='self_attention_mil_best.pt', help='Output checkpoint file path')
@@ -244,6 +258,8 @@ def main():
         split_suffix=args.split_suffix,
         pockets_path=args.pockets_path,
         full_proteins_path=args.full_proteins_path,
+        filter_dataset_path=args.filter_dataset,
+        prank_dir=args.prank_dir,
         save_model=args.save_model,
         config_json=args.config_json,
         min_prob=args.min_prob
