@@ -233,6 +233,7 @@ def cluster_structures(test_limit=None, tmscore_threshold=0.5, nr_threshold=None
             "-c", "0.8",
             "--threads", "8",
             "--cluster-mode", "1"
+            
         ]
         
         try:

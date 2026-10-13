@@ -176,7 +176,7 @@ def train_self_attention(
                 'hparams': {'hidden_dim': hidden_dim, 'num_heads': num_heads, 'dropout': dropout},
                 'preprocessing': prep_cfg,
             }, save_model)
-            save_msg = "🔥 (Model saved)"
+            save_msg = "(Model saved)"
         else:
             save_msg = ""
 

@@ -406,7 +406,7 @@ if __name__ == "__main__":
             json.dump(serializable, f)
 
     # 2. Analyze existing PDB files on disk and existing TSV entries
-    write_log(f"\n📂 Indexing local files in: {PDB_DIR}")
+    write_log(f"Indexing local files in: {PDB_DIR}")
     disk_pdbs = defaultdict(list)
     for fname in os.listdir(PDB_DIR):
         if fname.endswith(".pdb"):
@@ -449,13 +449,13 @@ if __name__ == "__main__":
             to_download.append(acc)
 
     if missing_from_tsv_but_on_disk > 0:
-        write_log(f"  ⚡ Recovered into TSV without downloading: {missing_from_tsv_but_on_disk} proteins from disk.")
+        write_log(f"Recovered into TSV without downloading: {missing_from_tsv_but_on_disk} proteins from disk.")
 
     write_log(f"\nRemaining to download from AlphaFold DB: {len(to_download)} / {len(master_dataset)} proteins.")
 
     # 4. Multi-threaded download of remaining items with live TSV streaming
     if to_download:
-        write_log(f"🚀 Launching parallel download ({NUM_WORKERS} workers)...")
+        write_log(f"Launching parallel download ({NUM_WORKERS} workers)...")
         stats = defaultdict(int)
         done_counter = 0
         total_needed = len(to_download)
